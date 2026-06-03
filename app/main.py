@@ -70,15 +70,21 @@ class Job:
 
 class LLMClient:
     def __init__(self) -> None:
-        self.endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate")
+        self.endpoint = os.getenv(
+            "OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"
+        )
         self.model = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 
-    def generate_code(self, summary: dict[str, Any], instruction: str, feedback: str = "") -> str:
+    def generate_code(
+        self, summary: dict[str, Any], instruction: str, feedback: str = ""
+    ) -> str:
         prompt = (
             "あなたはExcel編集用Pythonコード生成器です。"
-            "思考後に```python ... ```のみを出力してください。"
-            "import禁止。open/exec/eval禁止。許可変数は wb, ws, helpers のみ。\n"
+            "出力は```python ... ```のコードブロック1つだけにしてください。"
+            "説明文、思考過程、Markdown本文、箇条書きは禁止です。"
+            "使用可能な変数は wb, ws, helpers のみです。"
+            "import / open / exec / eval / ファイルI/O / ネットワーク / OS操作は禁止です。\n"
             f"sheet_summary={json.dumps(summary, ensure_ascii=False)}\n"
             f"instruction={instruction}\n"
             f"feedback={feedback}\n"
@@ -90,12 +96,19 @@ class LLMClient:
             "options": {"temperature": 0.1},
         }
         data = json.dumps(body).encode("utf-8")
-        req = Request(self.endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        req = Request(
+            self.endpoint,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except URLError as exc:
-            raise JobError("LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True) from exc
+            raise JobError(
+                "LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True
+            ) from exc
         text = payload.get("response", "")
         match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
         if match:
@@ -115,36 +128,101 @@ class CodeChecker:
         "subprocess",
         "socket",
         "shutil",
+        "input",
+        "breakpoint",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "getattr",
+        "setattr",
+        "delattr",
+        "type",
+        "object",
+        "super",
+        "memoryview",
     }
+    FORBIDDEN_NODES = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Lambda,
+        ast.With,
+        ast.AsyncWith,
+        ast.Try,
+        ast.Global,
+        ast.Nonlocal,
+        ast.Delete,
+        ast.Raise,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.Await,
+    )
 
     def validate(self, code: str, non_anchor_cells: set[str]) -> None:
         try:
             tree = ast.parse(code)
         except SyntaxError as exc:
-            raise JobError("CODE_CHECK_FAILED", f"生成コードの構文エラー: {exc}") from exc
+            raise JobError(
+                "CODE_CHECK_FAILED", f"生成コードの構文エラー: {exc}"
+            ) from exc
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise JobError("CODE_CHECK_FAILED", "生成コードに禁止された操作（import）が含まれていました")
+                raise JobError(
+                    "CODE_CHECK_FAILED",
+                    "生成コードに禁止された操作（import）が含まれていました",
+                )
+            if isinstance(node, self.FORBIDDEN_NODES):
+                raise JobError(
+                    "CODE_CHECK_FAILED",
+                    f"生成コードに禁止された構文が含まれていました: {type(node).__name__}",
+                )
             if isinstance(node, ast.Name) and node.id in self.FORBIDDEN_NAMES:
-                raise JobError("CODE_CHECK_FAILED", f"禁止された名前参照が含まれていました: {node.id}")
+                raise JobError(
+                    "CODE_CHECK_FAILED",
+                    f"禁止された名前参照が含まれていました: {node.id}",
+                )
             if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-                raise JobError("CODE_CHECK_FAILED", "ダンダー属性アクセスは禁止されています")
+                raise JobError(
+                    "CODE_CHECK_FAILED", "ダンダー属性アクセスは禁止されています"
+                )
             if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in self.FORBIDDEN_NAMES:
-                    raise JobError("CODE_CHECK_FAILED", f"禁止された関数呼び出しが含まれていました: {node.func.id}")
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in self.FORBIDDEN_NAMES
+                ):
+                    raise JobError(
+                        "CODE_CHECK_FAILED",
+                        f"禁止された関数呼び出しが含まれていました: {node.func.id}",
+                    )
             if isinstance(node, (ast.Assign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
                 for target in targets:
                     addr = self._extract_ws_address(target)
                     if addr and addr in non_anchor_cells:
-                        raise JobError("MERGED_CELL_CONFLICT", f"結合セル非アンカーへの書き込みは禁止です: {addr}")
+                        raise JobError(
+                            "MERGED_CELL_CONFLICT",
+                            f"結合セル非アンカーへの書き込みは禁止です: {addr}",
+                        )
 
     def _extract_ws_address(self, node: ast.AST) -> str | None:
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "ws":
-            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "ws"
+        ):
+            if isinstance(node.slice, ast.Constant) and isinstance(
+                node.slice.value, str
+            ):
                 return node.slice.value.upper()
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cell":
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "cell"
+        ):
             if isinstance(node.func.value, ast.Name) and node.func.value.id == "ws":
                 row = None
                 column = None
@@ -175,6 +253,14 @@ class CodeChecker:
         return out
 
 
+def _close_workbook(wb) -> None:
+    vba_archive = getattr(wb, "vba_archive", None)
+    if vba_archive is not None:
+        vba_archive.close()
+        wb.vba_archive = None
+    wb.close()
+
+
 def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
     ws.unmerge_cells(merged_range)
     anchor = merged_range.split(":", 1)[0]
@@ -182,7 +268,52 @@ def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
     ws.merge_cells(merged_range)
 
 
+def _summary_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _row_values(ws, row: int, min_col: int, max_col: int) -> list[Any]:
+    return [
+        _summary_value(ws.cell(row=row, column=col).value)
+        for col in range(min_col, max_col + 1)
+    ]
+
+
+def _non_empty_count(values: list[Any]) -> int:
+    return sum(value not in (None, "") for value in values)
+
+
 def _summarize_sheet(ws) -> dict[str, Any]:
+    sample_max_row = min(max(ws.max_row, 1), 30)
+    sample_max_col = 20
+    sample_values = [
+        {"row": row, "values": _row_values(ws, row, 1, sample_max_col)}
+        for row in range(1, sample_max_row + 1)
+    ]
+
+    merged_cells = []
+    for rng in ws.merged_cells.ranges:
+        min_col, min_row, _max_col, _max_row = rng.bounds
+        anchor = f"{CodeChecker._col_letters(min_col)}{min_row}"
+        merged_cells.append(
+            {
+                "range": str(rng),
+                "anchor": anchor,
+                "value": _summary_value(ws[anchor].value),
+            }
+        )
+
+    hidden_rows = [
+        idx for idx, dimension in ws.row_dimensions.items() if dimension.hidden
+    ]
+    hidden_columns = [
+        col for col, dimension in ws.column_dimensions.items() if dimension.hidden
+    ]
+
     formulas: list[str] = []
     for row in ws.iter_rows(
         min_row=1,
@@ -193,11 +324,53 @@ def _summarize_sheet(ws) -> dict[str, Any]:
         for cell in row:
             if isinstance(cell.value, str) and cell.value.startswith("="):
                 formulas.append(cell.coordinate)
+
+    header_candidates = []
+    for sample_row in sample_values:
+        values = sample_row["values"]
+        string_count = sum(
+            1 for value in values if isinstance(value, str) and value.strip()
+        )
+        if string_count >= 2 and _non_empty_count(values) >= 2:
+            header_candidates.append({"row": sample_row["row"], "values": values})
+
+    table_like_ranges = []
+    for candidate in header_candidates[:5]:
+        row = candidate["row"]
+        values = candidate["values"]
+        non_empty_cols = [
+            idx + 1 for idx, value in enumerate(values) if value not in (None, "")
+        ]
+        if not non_empty_cols:
+            continue
+        min_col = min(non_empty_cols)
+        max_col = max(non_empty_cols)
+        end_row = row
+        for scan_row in range(row + 1, min(ws.max_row, row + 200) + 1):
+            row_values = _row_values(ws, scan_row, min_col, max_col)
+            if _non_empty_count(row_values) == 0:
+                break
+            end_row = scan_row
+        table_like_ranges.append(
+            {
+                "range": f"{CodeChecker._col_letters(min_col)}{row}:{CodeChecker._col_letters(max_col)}{end_row}",
+                "header_row": row,
+                "columns": values[min_col - 1 : max_col],
+            }
+        )
+
     return {
         "sheet_name": ws.title,
         "max_row": ws.max_row,
         "max_col": ws.max_column,
         "merged_ranges": [str(rng) for rng in ws.merged_cells.ranges],
+        "merged_cells": merged_cells,
+        "hidden_rows": hidden_rows,
+        "hidden_columns": hidden_columns,
+        "protected": bool(ws.protection.sheet),
+        "sample_values": sample_values,
+        "header_candidates": header_candidates,
+        "table_like_ranges": table_like_ranges,
         "formula_cells": formulas,
     }
 
@@ -244,16 +417,23 @@ def _sandbox_runner(path: str, sheet_name: str, code: str, result_queue: Any) ->
         safe_locals = {
             "wb": wb,
             "ws": ws,
-            "helpers": {"safe_set_merged_value": lambda merged_range, value: _safe_set_merged_value(ws, merged_range, value)},
+            "helpers": {
+                "safe_set_merged_value": lambda merged_range, value: (
+                    _safe_set_merged_value(ws, merged_range, value)
+                )
+            },
         }
         exec(compile(code, "<generated>", "exec"), safe_globals, safe_locals)
         wb.save(path)
+        _close_workbook(wb)
         result_queue.put({"ok": True})
     except Exception:
         result_queue.put({"ok": False, "error": traceback.format_exc()})
 
 
-def _exec_in_sandbox(path: Path, sheet_name: str, code: str, timeout_sec: int = 30) -> None:
+def _exec_in_sandbox(
+    path: Path, sheet_name: str, code: str, timeout_sec: int = 30
+) -> None:
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     proc = ctx.Process(target=_sandbox_runner, args=(str(path), sheet_name, code, q))
@@ -262,13 +442,21 @@ def _exec_in_sandbox(path: Path, sheet_name: str, code: str, timeout_sec: int = 
     if proc.is_alive():
         proc.terminate()
         proc.join(5)
-        raise JobError("EXEC_TIMEOUT", "生成コードの実行がタイムアウトしました", retryable=True)
+        raise JobError(
+            "EXEC_TIMEOUT", "生成コードの実行がタイムアウトしました", retryable=True
+        )
     result = q.get() if not q.empty() else {"ok": False, "error": "no result"}
     if not result.get("ok"):
-        raise JobError("EXEC_RUNTIME_ERROR", f"実行エラー: {result.get('error', '')}", retryable=True)
+        raise JobError(
+            "EXEC_RUNTIME_ERROR",
+            f"実行エラー: {result.get('error', '')}",
+            retryable=True,
+        )
 
 
-def _create_preview(before_path: Path, after_path: Path, sheet_name: str) -> dict[str, Any]:
+def _create_preview(
+    before_path: Path, after_path: Path, sheet_name: str
+) -> dict[str, Any]:
     before = load_workbook(before_path, keep_vba=True, data_only=False)
     after = load_workbook(after_path, keep_vba=True, data_only=False)
     ws_before = before[sheet_name]
@@ -287,11 +475,17 @@ def _create_preview(before_path: Path, after_path: Path, sheet_name: str) -> dic
                         "cell": coord,
                         "before": c1.value,
                         "after": c2.value,
-                        "before_formula": c1.value if isinstance(c1.value, str) and c1.value.startswith("=") else None,
-                        "after_formula": c2.value if isinstance(c2.value, str) and c2.value.startswith("=") else None,
+                        "before_formula": c1.value
+                        if isinstance(c1.value, str) and c1.value.startswith("=")
+                        else None,
+                        "after_formula": c2.value
+                        if isinstance(c2.value, str) and c2.value.startswith("=")
+                        else None,
                         "style_changed": c1.style_id != c2.style_id,
                     }
                 )
+    _close_workbook(before)
+    _close_workbook(after)
     return {
         "sheet_name": sheet_name,
         "changed_cell_count": len(changed_cells),
@@ -315,7 +509,9 @@ class JobService:
         self.cleaner = threading.Thread(target=self._cleanup_loop, daemon=True)
         self.cleaner.start()
 
-    def create_job(self, upload: UploadFile, instruction: str, sheet_name: str | None) -> str:
+    def create_job(
+        self, upload: UploadFile, instruction: str, sheet_name: str | None
+    ) -> str:
         ext = Path(upload.filename or "").suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
             raise JobError("UNSUPPORTED_FORMAT", "対応形式は .xlsx / .xlsm のみです")
@@ -323,9 +519,14 @@ class JobService:
         if len(payload) > MAX_FILE_SIZE_BYTES:
             raise JobError("FILE_TOO_LARGE", "ファイルサイズが上限を超えています")
         try:
-            load_workbook(io.BytesIO(payload), keep_vba=True, data_only=False)
+            uploaded_wb = load_workbook(
+                io.BytesIO(payload), keep_vba=True, data_only=False
+            )
+            _close_workbook(uploaded_wb)
         except Exception as exc:
-            raise JobError("UNSUPPORTED_FORMAT", f"Excelファイルを開けませんでした: {exc}") from exc
+            raise JobError(
+                "UNSUPPORTED_FORMAT", f"Excelファイルを開けませんでした: {exc}"
+            ) from exc
 
         job_id = uuid.uuid4().hex
         work_dir = self.root_dir / job_id
@@ -386,17 +587,24 @@ class JobService:
         try:
             job.status = JobStatus.ANALYZING
             wb = load_workbook(job.source_path, keep_vba=True, data_only=False)
-            ws = wb[job.sheet_name] if job.sheet_name and job.sheet_name in wb.sheetnames else wb.active
+            ws = (
+                wb[job.sheet_name]
+                if job.sheet_name and job.sheet_name in wb.sheetnames
+                else wb.active
+            )
             sheet_name = ws.title
             summary = _summarize_sheet(ws)
             blocked_cells = _non_anchor_cells(ws)
+            _close_workbook(wb)
 
             generated_code = ""
             feedback = ""
             validation_errors: list[str] = []
             for _ in range(LLM_MAX_RETRY):
                 job.status = JobStatus.GENERATING
-                generated_code = self.llm.generate_code(summary, job.instruction, feedback=feedback)
+                generated_code = self.llm.generate_code(
+                    summary, job.instruction, feedback=feedback
+                )
                 job.status = JobStatus.CHECKING
                 try:
                     self.checker.validate(generated_code, blocked_cells)
@@ -405,11 +613,17 @@ class JobService:
                     feedback = f"{err.error_code}: {err.message}"
                     validation_errors.append(feedback)
             else:
-                reason = "; ".join(validation_errors) if validation_errors else "コード生成に失敗しました（検証詳細なし）"
-                raise JobError("CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}")
+                reason = (
+                    "; ".join(validation_errors)
+                    if validation_errors
+                    else "コード生成に失敗しました（検証詳細なし）"
+                )
+                raise JobError(
+                    "CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}"
+                )
 
             job.status = JobStatus.EXECUTING
-            result_path = job.work_dir / "result.xlsx"
+            result_path = job.work_dir / f"result{job.source_path.suffix}"
             shutil.copy2(job.source_path, result_path)
             _exec_in_sandbox(result_path, sheet_name, generated_code)
             job.preview = _create_preview(job.source_path, result_path, sheet_name)
@@ -431,7 +645,11 @@ class JobService:
             time.sleep(60)
             now = time.time()
             with self.lock:
-                expired = [job_id for job_id, job in self.jobs.items() if now - job.created_at > JOB_TTL_SECONDS]
+                expired = [
+                    job_id
+                    for job_id, job in self.jobs.items()
+                    if now - job.created_at > JOB_TTL_SECONDS
+                ]
             for job_id in expired:
                 with self.lock:
                     job = self.jobs.pop(job_id, None)
@@ -504,7 +722,11 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
     async def download(token: str):
         try:
             path = service.pop_download_path(token)
-            return FileResponse(path, filename="edited.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            return FileResponse(
+                path,
+                filename=f"edited{path.suffix}",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         except KeyError as err:
             raise HTTPException(status_code=404, detail="token not found") from err
 

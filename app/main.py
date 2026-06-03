@@ -1,6 +1,7 @@
 import ast
 import io
 import json
+import multiprocessing as mp
 import os
 import queue
 import re
@@ -24,6 +25,10 @@ ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 JOB_TTL_SECONDS = 3600
 LLM_MAX_RETRY = 3
+SUMMARY_FORMULA_MAX_ROWS = 200
+SUMMARY_FORMULA_MAX_COLS = 50
+PREVIEW_MAX_CHANGED_CELLS = 500
+PREVIEW_FORMULA_NOTE = "数式セルは文字列比較です。実値はExcelで再計算されます。"
 
 
 class JobStatus:
@@ -179,7 +184,12 @@ def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
 
 def _summarize_sheet(ws) -> dict[str, Any]:
     formulas: list[str] = []
-    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 200), min_col=1, max_col=min(ws.max_column, 50)):
+    for row in ws.iter_rows(
+        min_row=1,
+        max_row=min(ws.max_row, SUMMARY_FORMULA_MAX_ROWS),
+        min_col=1,
+        max_col=min(ws.max_column, SUMMARY_FORMULA_MAX_COLS),
+    ):
         for cell in row:
             if isinstance(cell.value, str) and cell.value.startswith("="):
                 formulas.append(cell.coordinate)
@@ -244,8 +254,6 @@ def _sandbox_runner(path: str, sheet_name: str, code: str, result_queue: Any) ->
 
 
 def _exec_in_sandbox(path: Path, sheet_name: str, code: str, timeout_sec: int = 30) -> None:
-    import multiprocessing as mp
-
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     proc = ctx.Process(target=_sandbox_runner, args=(str(path), sheet_name, code, q))
@@ -287,8 +295,8 @@ def _create_preview(before_path: Path, after_path: Path, sheet_name: str) -> dic
     return {
         "sheet_name": sheet_name,
         "changed_cell_count": len(changed_cells),
-        "changed_cells": changed_cells[:500],
-        "notes": ["数式セルは文字列比較です。実値はExcelで再計算されます。"],
+        "changed_cells": changed_cells[:PREVIEW_MAX_CHANGED_CELLS],
+        "notes": [PREVIEW_FORMULA_NOTE],
     }
 
 
@@ -385,6 +393,7 @@ class JobService:
 
             generated_code = ""
             feedback = ""
+            validation_errors: list[str] = []
             for _ in range(LLM_MAX_RETRY):
                 job.status = JobStatus.GENERATING
                 generated_code = self.llm.generate_code(summary, job.instruction, feedback=feedback)
@@ -394,8 +403,10 @@ class JobService:
                     break
                 except JobError as err:
                     feedback = f"{err.error_code}: {err.message}"
+                    validation_errors.append(feedback)
             else:
-                raise JobError("CODE_CHECK_FAILED", "コード再生成上限に達しました")
+                reason = "; ".join(validation_errors) if validation_errors else "コード生成に失敗しました（検証詳細なし）"
+                raise JobError("CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}")
 
             job.status = JobStatus.EXECUTING
             result_path = job.work_dir / "result.xlsx"

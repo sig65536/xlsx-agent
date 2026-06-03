@@ -15,4 +15,4 @@ uvicorn app.main:app --reload
 - `POST /jobs/{job_id}/approve` : 承認してダウンロードURLを返す
 - `GET /download/{token}` : ワンタイムトークンで結果をダウンロード
 
-対応形式は `.xlsx` / `.xlsm`（`keep_vba=True` で保持のみ）です。
+対応形式は `.xlsx` / `.xlsm`（`keep_vba=True` でVBAは保持のみ）です。マクロは実行せず、内容も変更しません。

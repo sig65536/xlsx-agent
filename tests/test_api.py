@@ -3,6 +3,7 @@ import io
 import time
 from pathlib import Path
 
+import pytest
 from fastapi import UploadFile
 from openpyxl import Workbook, load_workbook
 
@@ -94,9 +95,52 @@ def test_xlsm_job_lifecycle_preserves_result_and_download_extensions(
     assert 'filename="edited.xlsm"' in content_disposition
 
 
-def test_load_workbook_calls_keep_vba_true_policy_is_present() -> None:
-    source = Path("app/main.py").read_text()
-    assert source.count("keep_vba=True, data_only=False") >= 5
-    assert "uploaded_wb = load_workbook(" in source
-    assert "load_workbook(job.source_path, keep_vba=True, data_only=False)" in source
-    assert "load_workbook(path, keep_vba=True, data_only=False)" in source
+def test_keep_vba_policy_follows_extension() -> None:
+    from app.main import _keep_vba_for
+
+    assert _keep_vba_for("foo.xlsm") is True
+    assert _keep_vba_for("foo.xlsx") is False
+    assert _keep_vba_for(Path("dir/result.xlsx")) is False
+
+
+def test_xlsx_result_is_not_macro_enabled(tmp_path: Path) -> None:
+    """回帰テスト: .xlsx を往復しても macroEnabled content-type にならないこと。
+
+    keep_vba=True を .xlsx に使うと content-type が macroEnabled になり、
+    openpyxl では開けるが Excel が「破損」と判断する。これを防ぐ。
+    """
+    import zipfile
+
+    _service, _job_id, content, _cd = _run_lifecycle(tmp_path, "sample.xlsx")
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        content_types = zf.read("[Content_Types].xml").decode()
+    assert "macroEnabled" not in content_types
+
+
+def test_validate_excel_file_rejects_macro_content_type_on_xlsx(tmp_path: Path) -> None:
+    from app.main import JobError, validate_excel_file
+
+    bad = tmp_path / "bad.xlsx"
+    wb = Workbook()
+    wb.active["A1"] = "x"
+    # わざと keep_vba=True 相当の macroEnabled な状態で保存して壊れを再現
+    wb.save(bad)
+    # content-type を macroEnabled に差し替えて Excel 破損状態を作る
+    import shutil
+    import zipfile
+
+    tampered = tmp_path / "tampered.xlsx"
+    with zipfile.ZipFile(bad) as zin, zipfile.ZipFile(tampered, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"application/vnd.openxmlformats-officedocument."
+                    b"spreadsheetml.sheet.main+xml",
+                    b"application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+                )
+            zout.writestr(item, data)
+    shutil.copy2(tampered, tmp_path / "final.xlsx")
+    with pytest.raises(JobError) as err:
+        validate_excel_file(tmp_path / "final.xlsx")
+    assert err.value.error_code == "EXCEL_SAVE_VALIDATION_FAILED"

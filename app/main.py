@@ -321,12 +321,41 @@ def _close_workbook(wb) -> None:
     wb.close()
 
 
-def validate_excel_file(path: Path, keep_vba: bool = True) -> None:
+def _keep_vba_for(path) -> bool:
+    """VBA保持の要否を拡張子から決める。
+
+    .xlsm のみ keep_vba=True にする。plain .xlsx を keep_vba=True で保存すると
+    openpyxl がブックの content-type を macroEnabled (=.xlsm用) にしてしまい、
+    拡張子 .xlsx と矛盾して Excel が「破損」と判断する。拡張子に合わせるのが正解。
+    """
+    return str(path).lower().endswith(".xlsm")
+
+
+def _workbook_content_type(path: Path) -> str:
+    """[Content_Types].xml から /xl/workbook.xml のContentTypeを取り出す。"""
+    with zipfile.ZipFile(path) as zf:
+        content_types = zf.read("[Content_Types].xml").decode("utf-8", "ignore")
+    match = re.search(
+        r'PartName="/xl/workbook\.xml"[^>]*ContentType="([^"]+)"', content_types
+    )
+    return match.group(1) if match else ""
+
+
+def validate_excel_file(path: Path) -> None:
     """保存後のxlsx/xlsmが壊れていないか検証する。
 
     壊れたファイルをそのまま結果として渡さないための最終チェック。
-    zip構造（必須パートの存在）と openpyxl での再読込が通ることを確認する。
+    - zip構造（必須パートの存在）
+    - 拡張子と content-type の一致（.xlsx なのに macroEnabled になっていない等）
+    - openpyxl での再読込
+
+    ※ content-type の不一致は openpyxl では開けてしまうため、Excel だけが弾く
+      「開けないファイル」を検出するにはこのチェックが必須。
     """
+    ext = path.suffix.lower()
+    keep_vba = ext == ".xlsm"
+    expect_macro = ext == ".xlsm"
+
     if not path.exists():
         raise JobError("EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルが存在しません")
     if path.stat().st_size == 0:
@@ -343,6 +372,19 @@ def validate_excel_file(path: Path, keep_vba: bool = True) -> None:
                 raise JobError(
                     "EXCEL_SAVE_VALIDATION_FAILED", f"{required} がありません"
                 )
+        workbook_ct = _workbook_content_type(path)
+        is_macro_ct = "macroEnabled" in workbook_ct
+        if expect_macro and not is_macro_ct:
+            raise JobError(
+                "EXCEL_SAVE_VALIDATION_FAILED",
+                ".xlsm なのにマクロ有効ブックのcontent-typeになっていません",
+            )
+        if not expect_macro and is_macro_ct:
+            raise JobError(
+                "EXCEL_SAVE_VALIDATION_FAILED",
+                ".xlsx なのにマクロ有効ブックのcontent-typeになっています"
+                "（keep_vba誤用によるExcel破損）",
+            )
     except JobError:
         raise
     except Exception as exc:
@@ -487,7 +529,7 @@ def _non_anchor_cells(ws) -> set[str]:
 
 def _sandbox_runner(path: str, sheet_name: str, code: str, result_queue: Any) -> None:
     try:
-        wb = load_workbook(path, keep_vba=True, data_only=False)
+        wb = load_workbook(path, keep_vba=_keep_vba_for(path), data_only=False)
         ws = wb[sheet_name]
         safe_globals = {
             "__builtins__": {
@@ -522,11 +564,12 @@ def _sandbox_runner(path: str, sheet_name: str, code: str, result_queue: Any) ->
         }
         exec(compile(code, "<generated>", "exec"), safe_globals, safe_locals)
         target = Path(path)
-        tmp_path = target.with_name(target.name + ".tmp")
+        # 一時ファイルは有効な拡張子を保つ（.tmp だと openpyxl が再読込を拒否する）。
+        tmp_path = target.with_name(f"{target.stem}.tmp{target.suffix}")
         wb.save(tmp_path)
         _close_workbook(wb)
         # 壊れたファイルを採用しないよう、整合性検証後に原子的に差し替える。
-        validate_excel_file(tmp_path, keep_vba=True)
+        validate_excel_file(tmp_path)
         tmp_path.replace(target)
         result_queue.put({"ok": True})
     except JobError as je:
@@ -564,8 +607,10 @@ def _exec_in_sandbox(
 def _create_preview(
     before_path: Path, after_path: Path, sheet_name: str
 ) -> dict[str, Any]:
-    before = load_workbook(before_path, keep_vba=True, data_only=False)
-    after = load_workbook(after_path, keep_vba=True, data_only=False)
+    before = load_workbook(
+        before_path, keep_vba=_keep_vba_for(before_path), data_only=False
+    )
+    after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
     ws_before = before[sheet_name]
     ws_after = after[sheet_name]
     max_row = max(ws_before.max_row, ws_after.max_row)
@@ -627,7 +672,7 @@ class JobService:
             raise JobError("FILE_TOO_LARGE", "ファイルサイズが上限を超えています")
         try:
             uploaded_wb = load_workbook(
-                io.BytesIO(payload), keep_vba=True, data_only=False
+                io.BytesIO(payload), keep_vba=(ext == ".xlsm"), data_only=False
             )
             _close_workbook(uploaded_wb)
         except Exception as exc:
@@ -693,7 +738,9 @@ class JobService:
         job = self.get_job(job_id)
         try:
             job.status = JobStatus.ANALYZING
-            wb = load_workbook(job.source_path, keep_vba=True, data_only=False)
+            wb = load_workbook(
+                job.source_path, keep_vba=_keep_vba_for(job.source_path), data_only=False
+            )
             ws = (
                 wb[job.sheet_name]
                 if job.sheet_name and job.sheet_name in wb.sheetnames

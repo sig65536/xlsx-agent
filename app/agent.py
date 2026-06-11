@@ -265,11 +265,13 @@ def _disable_network() -> None:
 
     クラスを関数で差し替えると `isinstance(x, socket.socket)` 型チェックが壊れて
     openpyxl 等を巻き込む恐れがあるため、`__init__` を潰してインスタンス化のみを
-    禁止する（既存接続=mpのpipeは無傷）。名前解決(DNS)・低水準モジュール経由の
-    バイパスも塞ぐ。
+    禁止する（既存接続=mpのpipeは無傷）。名前解決(DNS)も塞ぐ。
+
+    ※ そもそも生成コードは `socket` / `_socket` を import できない
+      （import ホワイトリスト外）ため、これは worker プロセス自体に対する
+      多層防御の一枚。完全なegress遮断はOSレベル(コンテナ/FW)で行うのが本筋。
     """
     import socket
-    import sys
 
     def _blocked(*args, **kwargs):
         raise OSError("network access is disabled in the sandbox")
@@ -288,13 +290,6 @@ def _disable_network() -> None:
                 setattr(socket, _name, _blocked)
             except Exception:
                 pass
-    # 低水準モジュール(_socket)経由のバイパスも塞ぐ
-    _low = sys.modules.get("_socket")
-    if _low is not None and hasattr(_low, "socket"):
-        try:
-            _low.socket.__init__ = _blocked_init  # type: ignore[method-assign]
-        except Exception:
-            pass
 
 
 def _apply_resource_limits() -> None:
@@ -306,6 +301,14 @@ def _apply_resource_limits() -> None:
     except Exception:
         return  # Windows 等では resource が無いので no-op
 
+    def _int_env(name: str, default: int) -> int:
+        # 不正値（空文字/非数値/0以下）は既定値にフォールバックする
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
     def _limit(res_id, value: int) -> None:
         try:
             soft, hard = resource.getrlimit(res_id)
@@ -314,17 +317,15 @@ def _apply_resource_limits() -> None:
         except Exception:
             pass
 
-    _limit(resource.RLIMIT_CPU, int(os.getenv("XLSX_AGENT_WORKER_CPU_SEC", "300")))
-    _limit(
-        resource.RLIMIT_FSIZE,
-        int(os.getenv("XLSX_AGENT_WORKER_FSIZE_MB", "100")) * 1024 * 1024,
-    )
-    _limit(resource.RLIMIT_NOFILE, int(os.getenv("XLSX_AGENT_WORKER_NOFILE", "256")))
+    _limit(resource.RLIMIT_CPU, _int_env("XLSX_AGENT_WORKER_CPU_SEC", 300))
+    _limit(resource.RLIMIT_FSIZE, _int_env("XLSX_AGENT_WORKER_FSIZE_MB", 100) * 1024 * 1024)
+    _limit(resource.RLIMIT_NOFILE, _int_env("XLSX_AGENT_WORKER_NOFILE", 256))
     if hasattr(resource, "RLIMIT_NPROC"):
-        _limit(resource.RLIMIT_NPROC, int(os.getenv("XLSX_AGENT_WORKER_NPROC", "64")))
-    mem_mb = os.getenv("XLSX_AGENT_WORKER_MEM_MB")  # 既定は無制限（誤検知防止）
-    if mem_mb and hasattr(resource, "RLIMIT_AS"):
-        _limit(resource.RLIMIT_AS, int(mem_mb) * 1024 * 1024)
+        _limit(resource.RLIMIT_NPROC, _int_env("XLSX_AGENT_WORKER_NPROC", 64))
+    if os.getenv("XLSX_AGENT_WORKER_MEM_MB") and hasattr(resource, "RLIMIT_AS"):
+        mem_mb = _int_env("XLSX_AGENT_WORKER_MEM_MB", 0)  # 既定は無制限（誤検知防止）
+        if mem_mb > 0:
+            _limit(resource.RLIMIT_AS, mem_mb * 1024 * 1024)
 
 
 def _harden_worker_process() -> None:

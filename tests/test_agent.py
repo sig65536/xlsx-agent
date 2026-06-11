@@ -34,6 +34,27 @@ def _hardening_probe(conn):
     )
 
 
+def _network_probe(conn):
+    """spawn子プロセスでネットワーク遮断を適用し、結果を親へ返す（テスト用）。"""
+    import socket
+
+    from app.agent import _disable_network
+
+    _disable_network()
+    result = {"is_class": isinstance(socket.socket, type)}
+    try:
+        socket.socket()
+        result["socket"] = "open"
+    except OSError:
+        result["socket"] = "blocked"
+    try:
+        socket.getaddrinfo("example.com", 80)
+        result["dns"] = "open"
+    except OSError:
+        result["dns"] = "blocked"
+    conn.send(result)
+
+
 def _workbook_bytes() -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -287,21 +308,17 @@ def test_worker_reads_config_before_env_scrub() -> None:
 
 
 def test_disable_network_blocks_sockets() -> None:
-    import socket
-
-    from app.agent import _disable_network
-
-    orig_socket = socket.socket
-    orig_conn = socket.create_connection
-    try:
-        _disable_network()
-        with pytest.raises(OSError):
-            socket.socket()
-        with pytest.raises(OSError):
-            socket.create_connection(("example.com", 80))
-    finally:
-        socket.socket = orig_socket
-        socket.create_connection = orig_conn
+    # ネットワーク遮断は socket.socket.__init__ をパッチするため、メインの
+    # テストプロセスを汚さないよう spawn 子プロセスで検証する。
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_network_probe, args=(child,))
+    proc.start()
+    result = parent.recv()
+    proc.join(10)
+    assert result["socket"] == "blocked"
+    assert result["dns"] == "blocked"           # DNS(getaddrinfo)も遮断
+    assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:

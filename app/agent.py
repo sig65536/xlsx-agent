@@ -261,16 +261,40 @@ def _scrub_env(environ) -> None:
 
 
 def _disable_network() -> None:
-    """worker からのネットワーク発信を全面的に無効化する（移植性あり）。"""
+    """worker からのネットワーク発信を無効化する（移植性あり）。
+
+    クラスを関数で差し替えると `isinstance(x, socket.socket)` 型チェックが壊れて
+    openpyxl 等を巻き込む恐れがあるため、`__init__` を潰してインスタンス化のみを
+    禁止する（既存接続=mpのpipeは無傷）。名前解決(DNS)・低水準モジュール経由の
+    バイパスも塞ぐ。
+    """
     import socket
+    import sys
 
     def _blocked(*args, **kwargs):
         raise OSError("network access is disabled in the sandbox")
 
-    socket.socket = _blocked  # type: ignore[assignment]
-    socket.create_connection = _blocked  # type: ignore[assignment]
-    if hasattr(socket, "create_server"):
-        socket.create_server = _blocked  # type: ignore[assignment]
+    def _blocked_init(self, *args, **kwargs):
+        raise OSError("network access is disabled in the sandbox")
+
+    try:
+        socket.socket.__init__ = _blocked_init  # type: ignore[method-assign]
+    except Exception:
+        socket.socket = _blocked  # type: ignore[assignment]  # フォールバック
+    # 高水準API・名前解決を塞ぐ（DNS exfiltration 等の経路も断つ）
+    for _name in ("create_connection", "create_server", "getaddrinfo", "getnameinfo"):
+        if hasattr(socket, _name):
+            try:
+                setattr(socket, _name, _blocked)
+            except Exception:
+                pass
+    # 低水準モジュール(_socket)経由のバイパスも塞ぐ
+    _low = sys.modules.get("_socket")
+    if _low is not None and hasattr(_low, "socket"):
+        try:
+            _low.socket.__init__ = _blocked_init  # type: ignore[method-assign]
+        except Exception:
+            pass
 
 
 def _apply_resource_limits() -> None:
@@ -303,30 +327,12 @@ def _apply_resource_limits() -> None:
         _limit(resource.RLIMIT_AS, int(mem_mb) * 1024 * 1024)
 
 
-def _drop_privileges() -> None:
-    """root 実行時に低権限ユーザーへ降格する（POSIX・opt-in）。"""
-    import os
-
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        return
-    gid = os.getenv("XLSX_AGENT_WORKER_GID")
-    uid = os.getenv("XLSX_AGENT_WORKER_UID")
-    if gid:
-        try:
-            os.setgroups([])
-        except Exception:
-            pass
-        os.setgid(int(gid))
-    if uid:
-        os.setuid(int(uid))
-
-
 def _harden_worker_process() -> None:
     """worker 子プロセスに OS レベルの隔離を適用する（ベストエフォート）。
 
     生成コードは別プロセス＋制限付きビルトイン＋AST/import ガードで実行されるが、
     万一それらを抜けられても実害が出ないよう、プロセス自体の
-    ネットワーク・環境変数・リソース・権限を絞る。各処理は失敗しても無視し、
+    ネットワーク・環境変数・リソースを絞る。各処理は失敗しても無視し、
     未対応OS（Windows 等）では該当部分が no-op になる。
 
     ※ import 完了後に呼ぶこと（環境変数スクラブが起動時 import に影響しないよう）。
@@ -338,14 +344,10 @@ def _harden_worker_process() -> None:
             _disable_network()
         except Exception:
             pass
-    # リソース上限・権限ドロップは XLSX_AGENT_WORKER_* を参照するので、
-    # 環境変数スクラブより「先に」実行する（先にスクラブすると設定が消える）。
+    # リソース上限は XLSX_AGENT_WORKER_* を参照するので、環境変数スクラブより
+    # 「先に」実行する（先にスクラブすると設定が消える）。
     try:
         _apply_resource_limits()
-    except Exception:
-        pass
-    try:
-        _drop_privileges()
     except Exception:
         pass
     # 設定値を読み終えた後に env をスクラブ（XLSX_AGENT_* 自体も worker から消す）

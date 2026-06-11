@@ -1,4 +1,7 @@
 import io
+import multiprocessing as mp
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -13,6 +16,55 @@ from app.agent import (
     run_agent,
 )
 from app.main import JobError, JobService
+
+
+def _hardening_probe(conn):
+    """spawn子プロセスで hardening を適用し、結果を親へ返す（テスト用）。"""
+    import resource
+
+    from app.agent import _harden_worker_process
+
+    _harden_worker_process()
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    conn.send(
+        {
+            "nofile": soft,
+            "config_scrubbed": "XLSX_AGENT_WORKER_NOFILE" not in os.environ,
+        }
+    )
+
+
+def _network_probe(conn):
+    """spawn子プロセスでネットワーク遮断を適用し、結果を親へ返す（テスト用）。"""
+    import socket
+
+    from app.agent import _disable_network
+
+    _disable_network()
+    result = {"is_class": isinstance(socket.socket, type)}
+    try:
+        socket.socket()
+        result["socket"] = "open"
+    except OSError:
+        result["socket"] = "blocked"
+    try:
+        socket.getaddrinfo("example.com", 80)
+        result["dns"] = "open"
+    except OSError:
+        result["dns"] = "blocked"
+    try:
+        socket.gethostbyname("example.com")
+        result["legacy_dns"] = "open"
+    except OSError:
+        result["legacy_dns"] = "blocked"
+    # __init__ を迂回して __new__ で生成しても connect が塞がれている
+    try:
+        s = socket.socket.__new__(socket.socket)
+        s.connect(("example.com", 80))
+        result["new_connect"] = "open"
+    except Exception:
+        result["new_connect"] = "blocked"
+    conn.send(result)
 
 
 def _workbook_bytes() -> bytes:
@@ -228,6 +280,59 @@ def test_preview_detects_cross_sheet_edits(tmp_path: Path) -> None:
     preview = _create_preview(before, after, wb.active.title)
     assert preview["changed_cell_count"] >= 1
     assert "Other" in preview["sheets_changed"]
+
+
+def test_scrub_env_keeps_system_drops_secrets() -> None:
+    from app.agent import _scrub_env
+
+    env = {
+        "PATH": "/usr/bin",
+        "SYSTEMROOT": "C:/Windows",
+        "OLLAMA_ENDPOINT": "http://x",
+        "GITHUB_TOKEN": "secret",
+        "MY_API_KEY": "secret",
+    }
+    _scrub_env(env)
+    assert env.get("PATH") == "/usr/bin"
+    assert "SYSTEMROOT" in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MY_API_KEY" not in env
+    assert "OLLAMA_ENDPOINT" not in env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="resource limits are POSIX-only")
+def test_worker_reads_config_before_env_scrub() -> None:
+    """XLSX_AGENT_WORKER_* はスクラブより先に読まれる（順序バグの回帰テスト）。"""
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    os.environ["XLSX_AGENT_WORKER_NOFILE"] = "128"
+    os.environ["XLSX_AGENT_DISABLE_NETWORK"] = "0"
+    try:
+        proc = ctx.Process(target=_hardening_probe, args=(child,))
+        proc.start()
+        result = parent.recv()
+        proc.join(10)
+    finally:
+        os.environ.pop("XLSX_AGENT_WORKER_NOFILE", None)
+        os.environ.pop("XLSX_AGENT_DISABLE_NETWORK", None)
+    assert result["nofile"] == 128  # スクラブ前に設定を読めている
+    assert result["config_scrubbed"] is True  # その後 env はスクラブされている
+
+
+def test_disable_network_blocks_sockets() -> None:
+    # ネットワーク遮断は socket.socket.__init__ をパッチするため、メインの
+    # テストプロセスを汚さないよう spawn 子プロセスで検証する。
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_network_probe, args=(child,))
+    proc.start()
+    result = parent.recv()
+    proc.join(10)
+    assert result["socket"] == "blocked"
+    assert result["dns"] == "blocked"           # DNS(getaddrinfo)も遮断
+    assert result["legacy_dns"] == "blocked"     # 旧resolver(gethostbyname)も遮断
+    assert result["new_connect"] == "blocked"    # __new__ 迂回でも connect 不可
+    assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:

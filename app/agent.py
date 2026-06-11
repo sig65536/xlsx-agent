@@ -230,6 +230,151 @@ def precheck_step_code(code: str) -> None:
                     )
 
 
+# worker プロセスに残す環境変数（これ以外は秘密情報の露出を防ぐため削除）。
+# Python の起動・ファイル探索・ロケール・一時ディレクトリに必要な OS 標準の集合。
+# ※ Windows(本番サーバ)で worker が壊れないよう、Windows 標準変数も保持する。
+#   ここに無い独自変数（APIキー等）だけが削除される。
+_ENV_KEEP = {
+    # 共通 / POSIX
+    "PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING", "PYTHONHASHSEED",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "HOME", "USER", "LOGNAME",
+    "TMPDIR", "TEMP", "TMP",
+    # Windows 標準
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT", "COMSPEC",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
+    "ALLUSERSPROFILE", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "PROGRAMW6432", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)",
+    "PUBLIC", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "USERDOMAIN", "COMPUTERNAME", "SESSIONNAME",
+}
+
+
+def _scrub_env(environ) -> None:
+    """秘密情報が紛れ込まないよう、環境変数を最小限に絞る。"""
+    for key in list(environ.keys()):
+        if key.upper() not in _ENV_KEEP:
+            try:
+                del environ[key]
+            except Exception:
+                pass
+
+
+def _disable_network() -> None:
+    """worker からのネットワーク発信を無効化する（移植性あり）。
+
+    クラスを関数で差し替えると `isinstance(x, socket.socket)` 型チェックが壊れて
+    openpyxl 等を巻き込む恐れがあるため、`__init__` を潰してインスタンス化のみを
+    禁止する（既存接続=mpのpipeは無傷）。名前解決(DNS)も塞ぐ。
+
+    ※ そもそも生成コードは `socket` / `_socket` を import できない
+      （import ホワイトリスト外）ため、これは worker プロセス自体に対する
+      多層防御の一枚。完全なegress遮断はOSレベル(コンテナ/FW)で行うのが本筋。
+    """
+    import socket
+
+    def _blocked(*args, **kwargs):
+        raise OSError("network access is disabled in the sandbox")
+
+    def _blocked_init(self, *args, **kwargs):
+        raise OSError("network access is disabled in the sandbox")
+
+    try:
+        socket.socket.__init__ = _blocked_init  # type: ignore[method-assign]
+    except Exception:
+        socket.socket = _blocked  # type: ignore[assignment]  # フォールバック
+    # __init__ を迂回して __new__ 等で生成されても egress できないよう、
+    # 接続/送信メソッド自体も潰す（既存の mp pipe は connect/sendto を使わない）。
+    for _meth in ("connect", "connect_ex", "sendto"):
+        try:
+            setattr(socket.socket, _meth, _blocked)
+        except Exception:
+            pass
+    # 高水準API・名前解決を塞ぐ（DNS exfiltration 等の経路も断つ）。
+    # getaddrinfo 系だけでなく旧来の resolver(gethostby*) も含める。
+    for _name in (
+        "create_connection",
+        "create_server",
+        "getaddrinfo",
+        "getnameinfo",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "gethostbyaddr",
+        "getfqdn",
+    ):
+        if hasattr(socket, _name):
+            try:
+                setattr(socket, _name, _blocked)
+            except Exception:
+                pass
+
+
+def _apply_resource_limits() -> None:
+    """CPU/ファイルサイズ/FD/プロセス数の上限を設定する（POSIXのみ・best-effort）。"""
+    import os
+
+    try:
+        import resource
+    except Exception:
+        return  # Windows 等では resource が無いので no-op
+
+    def _int_env(name: str, default: int) -> int:
+        # 不正値（空文字/非数値/0以下）は既定値にフォールバックする
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _limit(res_id, value: int) -> None:
+        try:
+            soft, hard = resource.getrlimit(res_id)
+            new = value if hard == resource.RLIM_INFINITY else min(value, hard)
+            resource.setrlimit(res_id, (new, hard))
+        except Exception:
+            pass
+
+    _limit(resource.RLIMIT_CPU, _int_env("XLSX_AGENT_WORKER_CPU_SEC", 300))
+    _limit(resource.RLIMIT_FSIZE, _int_env("XLSX_AGENT_WORKER_FSIZE_MB", 100) * 1024 * 1024)
+    _limit(resource.RLIMIT_NOFILE, _int_env("XLSX_AGENT_WORKER_NOFILE", 256))
+    if hasattr(resource, "RLIMIT_NPROC"):
+        _limit(resource.RLIMIT_NPROC, _int_env("XLSX_AGENT_WORKER_NPROC", 64))
+    if os.getenv("XLSX_AGENT_WORKER_MEM_MB") and hasattr(resource, "RLIMIT_AS"):
+        mem_mb = _int_env("XLSX_AGENT_WORKER_MEM_MB", 0)  # 既定は無制限（誤検知防止）
+        if mem_mb > 0:
+            _limit(resource.RLIMIT_AS, mem_mb * 1024 * 1024)
+
+
+def _harden_worker_process() -> None:
+    """worker 子プロセスに OS レベルの隔離を適用する（ベストエフォート）。
+
+    生成コードは別プロセス＋制限付きビルトイン＋AST/import ガードで実行されるが、
+    万一それらを抜けられても実害が出ないよう、プロセス自体の
+    ネットワーク・環境変数・リソースを絞る。各処理は失敗しても無視し、
+    未対応OS（Windows 等）では該当部分が no-op になる。
+
+    ※ import 完了後に呼ぶこと（環境変数スクラブが起動時 import に影響しないよう）。
+    """
+    import os
+
+    if os.getenv("XLSX_AGENT_DISABLE_NETWORK", "1") != "0":
+        try:
+            _disable_network()
+        except Exception:
+            pass
+    # リソース上限は XLSX_AGENT_WORKER_* を参照するので、環境変数スクラブより
+    # 「先に」実行する（先にスクラブすると設定が消える）。
+    try:
+        _apply_resource_limits()
+    except Exception:
+        pass
+    # 設定値を読み終えた後に env をスクラブ（XLSX_AGENT_* 自体も worker から消す）
+    try:
+        _scrub_env(os.environ)
+    except Exception:
+        pass
+
+
 def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
     """spawnされる子プロセス本体。wb/wsを保持し、コマンドを逐次処理する。
 
@@ -250,6 +395,10 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
             _safe_set_merged_value,
             validate_excel_file,
         )
+
+        # import 完了後に OS レベルの隔離を適用（ネットワーク遮断・env スクラブ・
+        # POSIXのリソース上限）。未対応OSでは該当部分が no-op。
+        _harden_worker_process()
 
         keep_vba = _keep_vba_for(input_path)
 

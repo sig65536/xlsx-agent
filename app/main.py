@@ -1071,7 +1071,8 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
         sheet_name: str | None = Form(default=None),
     ) -> dict[str, Any]:
         try:
-            return chat.create_session(file, sheet_name)
+            # 同期I/O(load_workbook等)でイベントループを塞がないよう別スレッドで実行
+            return await run_in_threadpool(chat.create_session, file, sheet_name)
         except JobError as err:
             raise _chat_error(err) from err
 

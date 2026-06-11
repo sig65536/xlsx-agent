@@ -119,6 +119,20 @@ def test_import_whitelist_blocks_openpyxl_root_and_io() -> None:
     assert _is_allowed_import("subprocess") is False
 
 
+def test_agent_rolls_back_failed_step(tmp_path: Path) -> None:
+    """失敗ステップの途中変更は破棄され、保存に残らない。"""
+    out = _run_agent_on(
+        tmp_path,
+        [
+            "ws['A1'] = 'partial'\n1 / 0",   # A1 を書いた直後に例外 → ロールバック
+            "ws['B1'] = 'good'",             # こちらは成功 → 保持
+        ],
+    )
+    wb = load_workbook(out)
+    assert wb.active["A1"].value == "before"  # 失敗ステップの変更は残らない
+    assert wb.active["B1"].value == "good"
+
+
 def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
     """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
 

@@ -169,7 +169,7 @@ def precheck_step_code(code: str) -> None:
     import 自体はここでは弾かず、実行時の _safe_import がホワイトリスト判定する
     （モデルが import エラーを観測して自己修正できるようにするため）。
     """
-    from app.main import JobError
+    from app.common import JobError
 
     try:
         tree = ast.parse(code)
@@ -201,26 +201,48 @@ def precheck_step_code(code: str) -> None:
 
 
 def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
-    """spawnされる子プロセス本体。wb/wsを保持し、コマンドを逐次処理する。"""
+    """spawnされる子プロセス本体。wb/wsを保持し、コマンドを逐次処理する。
+
+    ※ `app.main` ではなく `app.common`（副作用なし）から部品を import する。
+      `app.main` を子プロセスで読むと `create_app()` が走り JobService の
+      スレッドが余計に起動してしまうため。
+
+    各ステップはトランザクション的に扱う：実行が失敗したら、その途中変更を
+    破棄して直近の成功状態（committed スナップショット）へロールバックする。
+    これにより失敗ステップの中途半端な変更が保存されない。
+    """
     try:
         from openpyxl import load_workbook
 
-        from app.main import _keep_vba_for, _safe_set_merged_value
-
-        wb = load_workbook(
-            input_path, keep_vba=_keep_vba_for(input_path), data_only=False
+        from app.common import (
+            _keep_vba_for,
+            _safe_set_merged_value,
+            validate_excel_file,
         )
-        ws = wb[sheet_name]
-        namespace: dict[str, Any] = {
-            "__builtins__": _make_safe_builtins(),
-            "wb": wb,
-            "ws": ws,
-            "helpers": {
-                "safe_set_merged_value": lambda merged_range, value: (
-                    _safe_set_merged_value(ws, merged_range, value)
-                )
-            },
-        }
+
+        keep_vba = _keep_vba_for(input_path)
+
+        def _build_namespace(workbook):
+            worksheet = workbook[sheet_name]
+            return {
+                "__builtins__": _make_safe_builtins(),
+                "wb": workbook,
+                "ws": worksheet,
+                "helpers": {
+                    "safe_set_merged_value": lambda merged_range, value: (
+                        _safe_set_merged_value(worksheet, merged_range, value)
+                    )
+                },
+            }
+
+        def _snapshot(workbook) -> bytes:
+            buffer = io.BytesIO()
+            workbook.save(buffer)
+            return buffer.getvalue()
+
+        wb = load_workbook(input_path, keep_vba=keep_vba, data_only=False)
+        namespace: dict[str, Any] = _build_namespace(wb)
+        committed = _snapshot(wb)  # 直近の「成功状態」のスナップショット
         conn.send({"ok": True})
     except Exception:
         try:
@@ -240,22 +262,30 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
             try:
                 with redirect_stdout(buf):
                     exec(compile(msg["code"], "<agent-step>", "exec"), namespace)
+                committed = _snapshot(namespace["wb"])  # 成功 → コミット
                 conn.send({"ok": True, "stdout": buf.getvalue()[-MAX_OBSERVATION_CHARS:]})
             except Exception:
+                error_text = traceback.format_exc()[-MAX_OBSERVATION_CHARS:]
+                # 失敗ステップの途中変更を破棄し、直近コミット状態へロールバック
+                try:
+                    wb = load_workbook(
+                        io.BytesIO(committed), keep_vba=keep_vba, data_only=False
+                    )
+                    namespace = _build_namespace(wb)
+                except Exception:
+                    pass
                 conn.send(
                     {
                         "ok": False,
                         "stdout": buf.getvalue()[-MAX_OBSERVATION_CHARS:],
-                        "error": traceback.format_exc()[-MAX_OBSERVATION_CHARS:],
+                        "error": error_text,
                     }
                 )
         elif cmd == "save":
             try:
-                from app.main import validate_excel_file
-
                 target = Path(msg["path"])
                 tmp_path = target.with_name(f"{target.stem}.tmp{target.suffix}")
-                wb.save(tmp_path)
+                namespace["wb"].save(tmp_path)
                 validate_excel_file(tmp_path)
                 tmp_path.replace(target)
                 conn.send({"ok": True})
@@ -277,7 +307,7 @@ class AgentSandbox:
     """親プロセス側のサンドボックス制御。1つの子プロセスにコマンドを送る。"""
 
     def __init__(self, input_path: Path, sheet_name: str, init_timeout: int = 30) -> None:
-        from app.main import JobError
+        from app.common import JobError
 
         ctx = mp.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
@@ -300,7 +330,7 @@ class AgentSandbox:
             )
 
     def _send(self, message: dict, fail_message: str) -> None:
-        from app.main import JobError
+        from app.common import JobError
 
         try:
             self._conn.send(message)
@@ -309,7 +339,7 @@ class AgentSandbox:
             raise JobError("AGENT_SANDBOX_CRASHED", fail_message, retryable=True) from exc
 
     def _recv(self, error_code: str, fail_message: str) -> dict:
-        from app.main import JobError
+        from app.common import JobError
 
         try:
             return self._conn.recv()
@@ -318,7 +348,7 @@ class AgentSandbox:
             raise JobError(error_code, fail_message, retryable=True) from exc
 
     def run(self, code: str, timeout: int) -> dict:
-        from app.main import JobError
+        from app.common import JobError
 
         self._send({"cmd": "exec", "code": code}, "サンドボックスへのコマンド送信に失敗しました")
         if not self._conn.poll(timeout):
@@ -332,7 +362,7 @@ class AgentSandbox:
         )
 
     def save(self, path: str, timeout: int) -> dict:
-        from app.main import JobError
+        from app.common import JobError
 
         self._send({"cmd": "save", "path": path}, "サンドボックスへの保存コマンド送信に失敗しました")
         if not self._conn.poll(timeout):
@@ -387,7 +417,7 @@ def run_agent(
     step_timeout: int = 30,
 ) -> dict:
     """ReActループ本体。working_path を直接編集する。失敗時 JobError。"""
-    from app.main import JobError
+    from app.common import JobError
 
     sandbox = AgentSandbox(working_path, sheet_name)
     transcript: list[dict[str, Any]] = []

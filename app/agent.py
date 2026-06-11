@@ -135,9 +135,17 @@ def _is_allowed_import(name: str) -> bool:
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     import builtins as _b
 
-    if level == 0 and _is_allowed_import(name):
-        return _b.__import__(name, globals, locals, fromlist, level)
-    raise ImportError(f"このサンドボックスでは '{name}' の import は許可されていません")
+    if level != 0 or not _is_allowed_import(name):
+        raise ImportError(f"このサンドボックスでは '{name}' の import は許可されていません")
+    # fromlist 経由のエイリアス脱獄を遮断する。
+    # 例: `from random import _os as x` は許可モジュール(random)に見えるが、
+    # 危険モジュール os を別名 x に束縛してしまい AST 検査をすり抜ける。
+    for item in fromlist or ():
+        if isinstance(item, str) and item.lstrip("_") in _DANGEROUS_NAMES:
+            raise ImportError(
+                f"禁止されたモジュール/名前の import は許可されていません: {item}"
+            )
+    return _b.__import__(name, globals, locals, fromlist, level)
 
 
 def _make_safe_builtins() -> dict:
@@ -178,11 +186,14 @@ def precheck_step_code(code: str) -> None:
         return identifier.lstrip("_") in _FORBIDDEN_NAMES
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and _is_forbidden(node.attr):
-            raise JobError(
-                "AGENT_CODE_REJECTED",
-                f"禁止された属性へのアクセスです: {node.attr}",
-            )
+        if isinstance(node, ast.Attribute):
+            # `.compile` 属性は re.compile 等の安全用途なので許可（ビルトイン
+            # compile の Name 参照は引き続き禁止）。
+            if node.attr != "compile" and _is_forbidden(node.attr):
+                raise JobError(
+                    "AGENT_CODE_REJECTED",
+                    f"禁止された属性へのアクセスです: {node.attr}",
+                )
         if isinstance(node, ast.Name) and _is_forbidden(node.id):
             raise JobError(
                 "AGENT_CODE_REJECTED", f"禁止された名前の参照: {node.id}"

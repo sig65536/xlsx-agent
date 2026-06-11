@@ -77,6 +77,23 @@ def test_precheck_rejects_escape() -> None:
         precheck_step_code("print(__builtins__)")
 
 
+def test_safe_import_blocks_dangerous_fromlist_alias() -> None:
+    from app.agent import _safe_import
+
+    # `from random import _os as x` 型の別名脱獄を import 時点で遮断
+    with pytest.raises(ImportError):
+        _safe_import("random", fromlist=("_os",))
+    with pytest.raises(ImportError):
+        _safe_import("datetime", fromlist=("os",))
+    # 正当な書式系 import は通る
+    assert _safe_import("openpyxl.styles", fromlist=("Font",)) is not None
+
+
+def test_precheck_allows_re_compile() -> None:
+    # 属性 .compile（re.compile 等）は誤検知で弾かない
+    precheck_step_code("import re\np = re.compile('[0-9]+')")
+
+
 def test_safe_builtins_is_minimal_allowlist() -> None:
     from app.agent import _make_safe_builtins
 

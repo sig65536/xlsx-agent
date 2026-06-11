@@ -836,7 +836,7 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
     service = job_service or JobService(Path(os.getenv("JOB_ROOT", "./data/jobs")))
 
     # ブラウザ（別PC）からのアクセスを許可する。
-    # 既定は全許可。社内LAN限定にしたい場合は CORS_ORIGINS にカンマ区切りで指定。
+    # 既定は全許可。特定のオリジンに限定したい場合は CORS_ORIGINS にカンマ区切りで指定。
     cors_origins = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "*").split(",")

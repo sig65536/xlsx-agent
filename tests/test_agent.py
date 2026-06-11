@@ -85,7 +85,7 @@ class StepLLM:
         self._codes = codes
         self.calls = 0
 
-    def agent_step(self, summary, instruction, transcript):
+    def agent_step(self, summary, instruction, transcript, think=None):
         idx = self.calls
         self.calls += 1
         if idx < len(self._codes):
@@ -221,7 +221,7 @@ def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
     """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
 
     class NeverDoneLLM:
-        def agent_step(self, summary, instruction, transcript):
+        def agent_step(self, summary, instruction, transcript, think=None):
             return "```python\nws['A1'] = 'x'\n```"
 
     src = tmp_path / "input.xlsx"
@@ -335,9 +335,101 @@ def test_disable_network_blocks_sockets() -> None:
     assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 
+def test_chat_session_flow_and_undo(tmp_path: Path) -> None:
+    from app.main import SessionService
+
+    class ChatStub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            if not transcript:
+                return "```python\nws['A1'] = 'hi'\n```"
+            return "DONE"
+
+    svc = SessionService(tmp_path / "sessions", llm=ChatStub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    info = svc.create_session(upload, None)
+    sid = info["session_id"]
+    assert "Sheet" in info["sheets"]
+
+    res = svc.post_message(sid, "A1をhiに変更")
+    assert res["preview"]["changed_cell_count"] >= 1
+    assert res["can_undo"] is True
+    wb = load_workbook(svc.current_path(sid))
+    assert wb.active["A1"].value == "hi"
+    wb.close()
+
+    # Undo で元に戻り、取り消した指示は履歴からも消える
+    svc.undo(sid)
+    wb2 = load_workbook(svc.current_path(sid))
+    assert wb2.active["A1"].value == "before"
+    wb2.close()
+    session = svc._get(sid)
+    assert not any(m.get("role") == "user" for m in session.messages)
+
+
+def test_chat_undo_limit_no_filename_collision(tmp_path: Path, monkeypatch) -> None:
+    """Undo上限トリム後も版ファイル名が衝突しない（SameFileError回帰）。"""
+    import app.main as main
+
+    monkeypatch.setattr(main, "CHAT_UNDO_LIMIT", 2)
+
+    class Stub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            if not transcript:
+                return "```python\nws.cell(row=ws.max_row + 1, column=1, value=1)\n```"
+            return "DONE"
+
+    svc = main.SessionService(tmp_path / "s", llm=Stub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+    for _ in range(5):  # 上限(2)を超えてトリムを発生させる
+        svc.post_message(sid, "1行追加")
+    session = svc._get(sid)
+    assert len(session.versions) == main.CHAT_UNDO_LIMIT + 1  # トリム済み
+    assert len(set(session.versions)) == len(session.versions)  # 名前衝突なし
+    assert all(p.exists() for p in session.versions)
+
+
+def test_chat_session_serializes_concurrent_messages(tmp_path: Path) -> None:
+    """同一セッションへの同時メッセージが直列化され、版が破損しないこと。"""
+    import threading
+
+    from app.main import SessionService
+
+    class CounterStub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            if not transcript:
+                # 末尾の空行を1つ埋める（毎回 max_row+1 に書き込む）
+                return "```python\nws.cell(row=ws.max_row + 1, column=1, value=1)\n```"
+            return "DONE"
+
+    svc = SessionService(tmp_path / "sessions", llm=CounterStub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+
+    errors: list = []
+
+    def worker() -> None:
+        try:
+            svc.post_message(sid, "1行追加")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    session = svc._get(sid)
+    assert not errors, errors
+    assert len(session.versions) == 5  # 元 + 4手（番号衝突なし）
+    assert len(set(session.versions)) == 5
+    assert all(p.exists() for p in session.versions)
+
+
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:
     class AgentStub:
-        def agent_step(self, summary, instruction, transcript):
+        def agent_step(self, summary, instruction, transcript, think=None):
             if not transcript:
                 return "```python\nws['A1'] = 'edited'\n```"
             return "DONE"

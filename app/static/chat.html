@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>xlsx-agent — チャットでExcel編集</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#1a1d24; --panel-2:#232733; --border:#2e3340;
+    --text:#e7e9ee; --muted:#9aa3b2; --accent:#4f8cff; --accent-strong:#2f6fe0;
+    --ok:#3ecf8e; --err:#ff6b6b; --warn:#f0a020; --user:#244; --bot:#1d2330;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    font-family:system-ui,"Segoe UI","Hiragino Kaku Gothic ProN",Meiryo,sans-serif;
+    background:var(--bg); color:var(--text); display:flex; flex-direction:column; height:100vh;
+  }
+  header {
+    padding:12px 18px; border-bottom:1px solid var(--border); display:flex;
+    align-items:center; gap:12px; flex-wrap:wrap;
+  }
+  header h1 { font-size:17px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  header .spacer { flex:1; }
+  header .model { color:var(--muted); font-size:11px; }
+  .toggle { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer; }
+  .btn { background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:7px; padding:7px 13px; font-size:13px; cursor:pointer; }
+  .btn:hover { border-color:var(--accent); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .btn.primary:hover { background:var(--accent-strong); }
+  main { flex:1; overflow-y:auto; padding:18px; }
+  .wrap { max-width:880px; margin:0 auto; }
+  /* アップロード画面 */
+  .drop {
+    border:2px dashed var(--border); border-radius:12px; padding:40px; text-align:center;
+    color:var(--muted); cursor:pointer; background:var(--panel-2); margin-top:8vh;
+  }
+  .drop.drag { border-color:var(--accent); color:var(--text); background:#1d2a44; }
+  .drop strong { color:var(--text); }
+  /* チャット */
+  .msg { margin:14px 0; display:flex; }
+  .msg.user { justify-content:flex-end; }
+  .bubble { max-width:88%; padding:10px 14px; border-radius:12px; font-size:14px; line-height:1.6; }
+  .msg.user .bubble { background:#21323f; border:1px solid #2c4456; }
+  .msg.bot .bubble { background:var(--bot); border:1px solid var(--border); width:100%; }
+  .msg.system .bubble { background:transparent; border:1px dashed var(--border); color:var(--muted); font-size:12px; }
+  .summary { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:8px; align-items:baseline; }
+  .summary .num { font-size:18px; font-weight:700; }
+  .summary .lbl { font-size:11px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; margin-top:6px; font-size:12.5px; }
+  th,td { text-align:left; padding:6px 9px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:11px; }
+  td.cell { font-family:ui-monospace,Menlo,monospace; color:var(--accent); white-space:nowrap; }
+  td.before { color:#ffb4b4; } td.after { color:#9be6c4; }
+  .val-empty { color:var(--muted); font-style:italic; }
+  .notice { font-size:12px; padding:8px 12px; border-radius:7px; margin:4px 0; }
+  .notice.err { background:#3a1d1d; color:#ffd4d4; border:1px solid #5a2a2a; }
+  .notice.info { background:var(--panel-2); color:var(--muted); border:1px solid var(--border); }
+  .tag { font-size:10px; padding:1px 5px; border-radius:4px; margin-left:6px; background:var(--panel-2); border:1px solid var(--border); color:var(--warn); }
+  .spinner { width:15px; height:15px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; display:inline-block; vertical-align:middle; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  /* 入力バー */
+  footer { border-top:1px solid var(--border); padding:12px 18px; }
+  .composer { max-width:880px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
+  .composer textarea {
+    flex:1; resize:none; background:var(--panel-2); border:1px solid var(--border);
+    border-radius:10px; color:var(--text); padding:10px 12px; font-size:14px; font-family:inherit; max-height:140px;
+  }
+  .composer textarea:focus { outline:none; border-color:var(--accent); }
+  .hint { color:var(--muted); font-size:11px; text-align:center; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>💬 xlsx-agent</h1>
+  <span class="sub" id="fileLabel">ファイル未選択</span>
+  <span class="spacer"></span>
+  <label class="toggle" title="思考モード（精度↑・速度↓）">
+    <input type="checkbox" id="thinkToggle" /> thinking
+  </label>
+  <button class="btn" id="undoBtn" disabled>↶ 1手戻す</button>
+  <button class="btn" id="downloadBtn" disabled>⬇ ダウンロード</button>
+  <button class="btn" id="newBtn">新規</button>
+  <span class="model" id="modelInfo"></span>
+</header>
+
+<main>
+  <div class="wrap" id="wrap">
+    <!-- アップロード -->
+    <div id="uploadView">
+      <div class="drop" id="drop">
+        <div style="font-size:15px;">Excelファイル（.xlsx / .xlsm、最大20MB）を</div>
+        <div>ここにドラッグ＆ドロップ、または<strong>クリックして選択</strong></div>
+        <input type="file" id="fileInput" accept=".xlsx,.xlsm" style="display:none" />
+        <div id="uploadError"></div>
+      </div>
+    </div>
+    <!-- チャット -->
+    <div id="chatView" style="display:none"></div>
+  </div>
+</main>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="編集の指示を入力（例: 1行目を太字にして / さっきの合計を赤字にして）" disabled></textarea>
+    <button class="btn primary" id="sendBtn" disabled>送信</button>
+  </div>
+  <div class="hint">承認なしで適用されます。間違えたら「1手戻す」でUndoできます。元ファイルは変更されません。</div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null, busy = false;
+
+function esc(s){ if(s===null||s===undefined||s==="") return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function fmtVal(v){ return (v===null||v===undefined||v==="") ? '<span class="val-empty">（空）</span>' : esc(v); }
+
+// ---- アップロード ----
+const drop = $("drop");
+drop.onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => e.target.files[0] && uploadFile(e.target.files[0]);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("drag"); };
+drop.ondragleave = () => drop.classList.remove("drag");
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("drag"); e.dataTransfer.files[0] && uploadFile(e.dataTransfer.files[0]); };
+
+async function uploadFile(file) {
+  if (!/\.(xlsx|xlsm)$/i.test(file.name)) { $("uploadError").innerHTML = '<div class="notice err">対応形式は .xlsx / .xlsm のみです。</div>'; return; }
+  if (file.size > 20*1024*1024) { $("uploadError").innerHTML = '<div class="notice err">20MBを超えています。</div>'; return; }
+  $("uploadError").innerHTML = '<div class="notice info"><span class="spinner"></span> アップロード中…</div>';
+  const fd = new FormData(); fd.append("file", file);
+  try {
+    const res = await fetch("sessions", { method:"POST", body:fd });
+    const data = await res.json();
+    if (!res.ok) { $("uploadError").innerHTML = `<div class="notice err">${esc((data.detail||data).message||"失敗")}</div>`; return; }
+    sessionId = data.session_id;
+    $("fileLabel").textContent = `📄 ${file.name}（シート: ${esc(data.active_sheet)}）`;
+    $("uploadView").style.display = "none";
+    $("chatView").style.display = "block";
+    $("input").disabled = false; $("sendBtn").disabled = false; $("downloadBtn").disabled = false;
+    $("input").focus();
+    addSystem(`「${file.name}」を読み込みました。編集の指示をどうぞ。`);
+  } catch (e) { $("uploadError").innerHTML = `<div class="notice err">接続エラー: ${esc(e.message)}</div>`; }
+}
+
+// ---- メッセージ描画 ----
+function addUser(text){ const d=document.createElement("div"); d.className="msg user"; d.innerHTML=`<div class="bubble">${esc(text)}</div>`; $("chatView").appendChild(d); scroll(); }
+function addSystem(text){ const d=document.createElement("div"); d.className="msg system"; d.innerHTML=`<div class="bubble">${esc(text)}</div>`; $("chatView").appendChild(d); scroll(); }
+function addBot(html){ const d=document.createElement("div"); d.className="msg bot"; d.innerHTML=`<div class="bubble">${html}</div>`; $("chatView").appendChild(d); scroll(); return d; }
+function scroll(){ const m=document.querySelector("main"); m.scrollTop=m.scrollHeight; }
+
+function previewHtml(preview){
+  const shown = preview.changed_cells || [];
+  const sheets = preview.sheets_changed && preview.sheets_changed.length ? preview.sheets_changed.join(", ") : "—";
+  let rows = "";
+  if (shown.length === 0) rows = '<tr><td colspan="3" class="val-empty">変更はありませんでした。</td></tr>';
+  for (const c of shown) {
+    const styleTag = c.style_changed ? '<span class="tag">書式</span>' : "";
+    const label = esc(c.sheet ? `${c.sheet}!${c.cell}` : c.cell);
+    rows += `<tr><td class="cell">${label}${styleTag}</td><td class="before">${fmtVal(c.before)}</td><td class="after">${fmtVal(c.after)}</td></tr>`;
+  }
+  const truncated = preview.changed_cell_count > shown.length;
+  return `<div class="summary"><div><span class="num">${preview.changed_cell_count}</span> <span class="lbl">変更セル</span></div>`
+    + `<div><span class="lbl">対象シート:</span> ${esc(sheets)}</div></div>`
+    + (truncated ? `<div class="notice info">表示は先頭 ${shown.length} 件（全 ${preview.changed_cell_count} 件）</div>` : "")
+    + `<div style="overflow:auto;max-height:340px"><table><thead><tr><th>セル</th><th>変更前</th><th>変更後</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// ---- 送信 ----
+$("input").addEventListener("keydown", (e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
+$("input").addEventListener("input", ()=>{ const t=$("input"); t.style.height="auto"; t.style.height=Math.min(t.scrollHeight,140)+"px"; });
+$("sendBtn").onclick = send;
+
+async function send(){
+  if (busy || !sessionId) return;
+  const text = $("input").value.trim();
+  if (!text) return;
+  addUser(text);
+  $("input").value=""; $("input").style.height="auto";
+  setBusy(true);
+  const pending = addBot('<span class="spinner"></span> 編集中…');
+  const fd = new FormData(); fd.append("instruction", text); fd.append("think", $("thinkToggle").checked ? "true":"false");
+  try {
+    const res = await fetch(`sessions/${sessionId}/messages`, { method:"POST", body:fd });
+    const data = await res.json();
+    if (!res.ok) {
+      const d = data.detail||data;
+      pending.querySelector(".bubble").innerHTML = `<div class="notice err">⚠️ [${esc(d.error_code||"")}] ${esc(d.message||"失敗")}${d.retryable?'<br><small>再試行で成功する場合があります。</small>':''}</div>`;
+    } else {
+      pending.querySelector(".bubble").innerHTML = previewHtml(data.preview);
+      $("undoBtn").disabled = !data.can_undo;
+    }
+  } catch (e) {
+    pending.querySelector(".bubble").innerHTML = `<div class="notice err">接続エラー: ${esc(e.message)}</div>`;
+  } finally { setBusy(false); }
+}
+function setBusy(b){ busy=b; $("sendBtn").disabled=b; $("input").disabled=b; if(!b) $("input").focus(); }
+
+// ---- Undo / Download / New ----
+$("undoBtn").onclick = async () => {
+  if (!sessionId) return;
+  try {
+    const res = await fetch(`sessions/${sessionId}/undo`, { method:"POST" });
+    const data = await res.json();
+    if (res.ok) { addSystem("↶ 1手戻しました"); $("undoBtn").disabled = !data.can_undo; }
+    else addSystem((data.detail||data).message || "戻せません");
+  } catch (e) { addSystem("Undo失敗: " + e.message); }
+};
+$("downloadBtn").onclick = () => { if (sessionId) window.location = `sessions/${sessionId}/download`; };
+$("newBtn").onclick = () => location.reload();
+
+fetch("healthz").then(r=>r.json()).then(d=>{
+  if (d.model) $("modelInfo").textContent = "model: " + d.model;
+  if (d.think) $("thinkToggle").checked = true;
+}).catch(()=>{});
+</script>
+</body>
+</html>

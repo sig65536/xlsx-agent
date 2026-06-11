@@ -629,6 +629,7 @@ def run_agent(
     llm,
     max_steps: int = 6,
     step_timeout: int = 30,
+    think: bool | None = None,
 ) -> dict:
     """ReActループ本体。working_path を直接編集する。失敗時 JobError。"""
     from app.common import JobError
@@ -639,7 +640,7 @@ def run_agent(
     completed = False
     try:
         for step in range(1, max_steps + 1):
-            text = llm.agent_step(summary, instruction, transcript)
+            text = llm.agent_step(summary, instruction, transcript, think=think)
             kind, code = parse_action(text)
             if kind == "done":
                 completed = True

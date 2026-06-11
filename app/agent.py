@@ -81,21 +81,25 @@ _DANGEROUS_NAMES = {
     "spawn",
 }
 
-# ビルトインから除去する危険な名前（システムアクセス・脱獄経路）
-_DENY_BUILTINS = {
-    "open",
-    "eval",
-    "exec",
-    "compile",
-    "input",
-    "breakpoint",
-    "memoryview",
-    "globals",
-    "locals",
-    "vars",
-    "getattr",
-    "setattr",
-    "delattr",
+# サンドボックスで公開するビルトインの「明示的許可リスト」。
+# dir(builtins) からの除外方式だと site が注入する license/copyright/help 等が
+# 残り、`license._Printer__filenames` 経由で任意ファイルを開示できてしまうため、
+# 必要なものだけを列挙する方式にする（type/object/super/getattr 等は意図的に除外）。
+_ALLOWED_BUILTINS = {
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
+    "format", "frozenset", "hasattr", "hash", "hex", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
+    "ord", "pow", "print", "range", "repr", "reversed", "round", "set",
+    "slice", "sorted", "str", "sum", "tuple", "zip",
+}
+# try/except で使う例外クラス
+_ALLOWED_EXCEPTIONS = {
+    "BaseException", "Exception", "ArithmeticError", "AssertionError",
+    "AttributeError", "FloatingPointError", "IndexError", "KeyError",
+    "LookupError", "NameError", "NotImplementedError", "OverflowError",
+    "RuntimeError", "StopIteration", "TypeError", "ValueError",
+    "ZeroDivisionError",
 }
 
 # 事前ASTチェックで弾く名前参照（ビルトイン除去と二重防御）。
@@ -141,8 +145,8 @@ def _make_safe_builtins() -> dict:
 
     safe = {
         name: getattr(_b, name)
-        for name in dir(_b)
-        if not name.startswith("_") and name not in _DENY_BUILTINS and hasattr(_b, name)
+        for name in (_ALLOWED_BUILTINS | _ALLOWED_EXCEPTIONS)
+        if hasattr(_b, name)
     }
     safe["__import__"] = _safe_import
     # class 文を許可するために必要（脱獄経路ではない）
@@ -163,20 +167,23 @@ def precheck_step_code(code: str) -> None:
         tree = ast.parse(code)
     except SyntaxError as exc:
         raise JobError("AGENT_CODE_SYNTAX", f"生成コードの構文エラー: {exc}") from exc
+
+    def _is_forbidden(identifier: str) -> bool:
+        # ダンダー(__builtins__ 等)は一括禁止。先頭の "_" を剥がした名前も照合し、
+        # `re._sys` / `random._os` のようなプライベート別名経由の脱獄を防ぐ。
+        if identifier.startswith("__"):
+            return True
+        if identifier in _FORBIDDEN_NAMES:
+            return True
+        return identifier.lstrip("_") in _FORBIDDEN_NAMES
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            if node.attr.startswith("__"):
-                raise JobError(
-                    "AGENT_CODE_REJECTED",
-                    f"ダンダー属性アクセスは禁止されています: {node.attr}",
-                )
-            # 許可モジュール経由の属性チェーン脱獄（例 random.os.system）を遮断
-            if node.attr in _FORBIDDEN_NAMES:
-                raise JobError(
-                    "AGENT_CODE_REJECTED",
-                    f"禁止された属性へのアクセスです: {node.attr}",
-                )
-        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+        if isinstance(node, ast.Attribute) and _is_forbidden(node.attr):
+            raise JobError(
+                "AGENT_CODE_REJECTED",
+                f"禁止された属性へのアクセスです: {node.attr}",
+            )
+        if isinstance(node, ast.Name) and _is_forbidden(node.id):
             raise JobError(
                 "AGENT_CODE_REJECTED", f"禁止された名前の参照: {node.id}"
             )

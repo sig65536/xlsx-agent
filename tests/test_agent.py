@@ -68,6 +68,26 @@ def test_precheck_rejects_escape() -> None:
         precheck_step_code("import os\nos.listdir('/')")
     with pytest.raises(JobError):
         precheck_step_code("x.subprocess.Popen(['ls'])")
+    # プライベート別名(_os/_sys)経由・__builtins__ 参照も遮断
+    with pytest.raises(JobError):
+        precheck_step_code("import random\nrandom._os.system('whoami')")
+    with pytest.raises(JobError):
+        precheck_step_code("re._sys.modules")
+    with pytest.raises(JobError):
+        precheck_step_code("print(__builtins__)")
+
+
+def test_safe_builtins_is_minimal_allowlist() -> None:
+    from app.agent import _make_safe_builtins
+
+    builtins = _make_safe_builtins()
+    # site が注入する開示系・危険系は含まれない
+    for name in ("license", "copyright", "credits", "help", "open", "eval",
+                 "exec", "getattr", "globals", "input", "exit", "quit"):
+        assert name not in builtins, name
+    # Excel編集に必要な基本ビルトインは含まれる
+    for name in ("range", "len", "print", "sorted", "enumerate", "str", "int"):
+        assert name in builtins, name
 
 
 def test_import_whitelist_blocks_openpyxl_root_and_io() -> None:

@@ -230,6 +230,42 @@ def test_preview_detects_cross_sheet_edits(tmp_path: Path) -> None:
     assert "Other" in preview["sheets_changed"]
 
 
+def test_scrub_env_keeps_system_drops_secrets() -> None:
+    from app.agent import _scrub_env
+
+    env = {
+        "PATH": "/usr/bin",
+        "SYSTEMROOT": "C:/Windows",
+        "OLLAMA_ENDPOINT": "http://x",
+        "GITHUB_TOKEN": "secret",
+        "MY_API_KEY": "secret",
+    }
+    _scrub_env(env)
+    assert env.get("PATH") == "/usr/bin"
+    assert "SYSTEMROOT" in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MY_API_KEY" not in env
+    assert "OLLAMA_ENDPOINT" not in env
+
+
+def test_disable_network_blocks_sockets() -> None:
+    import socket
+
+    from app.agent import _disable_network
+
+    orig_socket = socket.socket
+    orig_conn = socket.create_connection
+    try:
+        _disable_network()
+        with pytest.raises(OSError):
+            socket.socket()
+        with pytest.raises(OSError):
+            socket.create_connection(("example.com", 80))
+    finally:
+        socket.socket = orig_socket
+        socket.create_connection = orig_conn
+
+
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:
     class AgentStub:
         def agent_step(self, summary, instruction, transcript):

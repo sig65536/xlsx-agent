@@ -75,6 +75,14 @@ def test_precheck_rejects_escape() -> None:
         precheck_step_code("re._sys.modules")
     with pytest.raises(JobError):
         precheck_step_code("print(__builtins__)")
+    # import の別名経由（ast.alias）の禁止名/ダンダーを遮断
+    with pytest.raises(JobError):
+        precheck_step_code("import os as x\nx.listdir('/')")
+    with pytest.raises(JobError):
+        precheck_step_code("from datetime import __class__ as c")
+    # 文字列フォーマット経由の属性チェーン脱獄を遮断
+    with pytest.raises(JobError):
+        precheck_step_code("ws['A1'] = '{0.__class__.__init__}'.format(ws)")
 
 
 def test_safe_import_blocks_dangerous_fromlist_alias() -> None:

@@ -198,6 +198,24 @@ def precheck_step_code(code: str) -> None:
             raise JobError(
                 "AGENT_CODE_REJECTED", f"禁止された名前の参照: {node.id}"
             )
+        # import の対象名・別名も検査（例: `from datetime import __class__ as x`）
+        if isinstance(node, ast.alias):
+            if _is_forbidden(node.name) or (
+                node.asname and _is_forbidden(node.asname)
+            ):
+                raise JobError(
+                    "AGENT_CODE_REJECTED",
+                    f"禁止された名前の import / 別名です: {node.name}",
+                )
+        # 文字列フォーマット経由の属性アクセス脱獄を遮断
+        # （例: '{0.__class__.__init__.__globals__[os]}'.format(ws)）。
+        # AST では見えない属性チェーンを文字列内で行う典型パターンを弾く。
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "__" in node.value and ("{" in node.value or "%" in node.value):
+                raise JobError(
+                    "AGENT_CODE_REJECTED",
+                    "文字列フォーマットを介した属性アクセスは禁止されています",
+                )
 
 
 def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
@@ -282,14 +300,20 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
                     }
                 )
         elif cmd == "save":
+            target = Path(msg["path"])
+            tmp_path = target.with_name(f"{target.stem}.tmp{target.suffix}")
             try:
-                target = Path(msg["path"])
-                tmp_path = target.with_name(f"{target.stem}.tmp{target.suffix}")
                 namespace["wb"].save(tmp_path)
                 validate_excel_file(tmp_path)
                 tmp_path.replace(target)
                 conn.send({"ok": True})
             except Exception as exc:
+                # 検証失敗などで残った一時ファイルを掃除する
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
                 error_code = getattr(exc, "error_code", "EXCEL_SAVE_VALIDATION_FAILED")
                 message = getattr(exc, "message", None) or traceback.format_exc()[
                     -MAX_OBSERVATION_CHARS:

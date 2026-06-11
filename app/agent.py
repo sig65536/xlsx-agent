@@ -19,7 +19,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 
-# import 可能なトップレベルモジュール（これ以外の import は ImportError にする）
+# import 可能な標準ライブラリのルート（サブモジュールも許可）。
+# I/O・システムアクセスを伴うモジュールは含めない。
 _SAFE_IMPORT_ROOTS = {
     "datetime",
     "re",
@@ -37,7 +38,47 @@ _SAFE_IMPORT_ROOTS = {
     "random",
     "textwrap",
     "unicodedata",
-    "openpyxl",
+}
+
+# openpyxl は「丸ごと」は許可しない（`from openpyxl import load_workbook` で
+# サーバー上の任意ブックを読み出し print() 経由で内容を漏洩できてしまうため）。
+# ファイルI/Oを伴わない書式・ユーティリティ系サブモジュールだけを許可する。
+_SAFE_OPENPYXL_MODULES = {
+    "openpyxl.styles",
+    "openpyxl.utils",
+    "openpyxl.utils.cell",
+    "openpyxl.comments",
+    "openpyxl.formatting",
+    "openpyxl.formatting.rule",
+    "openpyxl.worksheet.table",
+    "openpyxl.chart",
+}
+
+# 安全なモジュール経由でも到達させてはいけない危険モジュール／属性名。
+# precheck で ast.Name / ast.Attribute の両方として遮断する
+# （例: `import random; random.os.system(...)` のような属性チェーン脱獄を防ぐ）。
+_DANGEROUS_NAMES = {
+    "os",
+    "sys",
+    "subprocess",
+    "socket",
+    "shutil",
+    "ctypes",
+    "importlib",
+    "posix",
+    "nt",
+    "builtins",
+    "platform",
+    "multiprocessing",
+    "threading",
+    "signal",
+    "pickle",
+    "marshal",
+    "inspect",
+    "pty",
+    "system",
+    "popen",
+    "spawn",
 }
 
 # ビルトインから除去する危険な名前（システムアクセス・脱獄経路）
@@ -57,7 +98,8 @@ _DENY_BUILTINS = {
     "delattr",
 }
 
-# 事前ASTチェックで弾く名前参照（ビルトイン除去と二重防御）
+# 事前ASTチェックで弾く名前参照（ビルトイン除去と二重防御）。
+# 危険モジュール名(_DANGEROUS_NAMES)も含め、ast.Name / ast.Attribute の両方で遮断する。
 _FORBIDDEN_NAMES = {
     "eval",
     "exec",
@@ -72,16 +114,24 @@ _FORBIDDEN_NAMES = {
     "locals",
     "vars",
     "__import__",
-}
+} | _DANGEROUS_NAMES
 
 MAX_OBSERVATION_CHARS = 1500
+
+
+def _is_allowed_import(name: str) -> bool:
+    root = name.split(".", 1)[0]
+    if root in _SAFE_IMPORT_ROOTS:
+        return True
+    if name in _SAFE_OPENPYXL_MODULES:
+        return True
+    return any(name.startswith(f"{mod}.") for mod in _SAFE_OPENPYXL_MODULES)
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     import builtins as _b
 
-    root = name.split(".", 1)[0]
-    if level == 0 and root in _SAFE_IMPORT_ROOTS:
+    if level == 0 and _is_allowed_import(name):
         return _b.__import__(name, globals, locals, fromlist, level)
     raise ImportError(f"このサンドボックスでは '{name}' の import は許可されていません")
 
@@ -114,11 +164,18 @@ def precheck_step_code(code: str) -> None:
     except SyntaxError as exc:
         raise JobError("AGENT_CODE_SYNTAX", f"生成コードの構文エラー: {exc}") from exc
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            raise JobError(
-                "AGENT_CODE_REJECTED",
-                f"ダンダー属性アクセスは禁止されています: {node.attr}",
-            )
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                raise JobError(
+                    "AGENT_CODE_REJECTED",
+                    f"ダンダー属性アクセスは禁止されています: {node.attr}",
+                )
+            # 許可モジュール経由の属性チェーン脱獄（例 random.os.system）を遮断
+            if node.attr in _FORBIDDEN_NAMES:
+                raise JobError(
+                    "AGENT_CODE_REJECTED",
+                    f"禁止された属性へのアクセスです: {node.attr}",
+                )
         if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
             raise JobError(
                 "AGENT_CODE_REJECTED", f"禁止された名前の参照: {node.id}"
@@ -216,7 +273,7 @@ class AgentSandbox:
         if not self._conn.poll(init_timeout):
             self.close()
             raise JobError("AGENT_INIT_FAILED", "サンドボックス初期化がタイムアウトしました")
-        ready = self._conn.recv()
+        ready = self._recv("AGENT_INIT_FAILED", "サンドボックス初期化中にプロセスが予期せず終了しました")
         if not ready.get("ok"):
             self.close()
             raise JobError(
@@ -224,27 +281,50 @@ class AgentSandbox:
                 f"サンドボックス初期化に失敗しました: {ready.get('error', '')}",
             )
 
+    def _send(self, message: dict, fail_message: str) -> None:
+        from app.main import JobError
+
+        try:
+            self._conn.send(message)
+        except OSError as exc:
+            self.close()
+            raise JobError("AGENT_SANDBOX_CRASHED", fail_message, retryable=True) from exc
+
+    def _recv(self, error_code: str, fail_message: str) -> dict:
+        from app.main import JobError
+
+        try:
+            return self._conn.recv()
+        except (EOFError, OSError) as exc:
+            self.close()
+            raise JobError(error_code, fail_message, retryable=True) from exc
+
     def run(self, code: str, timeout: int) -> dict:
         from app.main import JobError
 
-        self._conn.send({"cmd": "exec", "code": code})
+        self._send({"cmd": "exec", "code": code}, "サンドボックスへのコマンド送信に失敗しました")
         if not self._conn.poll(timeout):
             self.close()
             raise JobError(
                 "EXEC_TIMEOUT", "ステップ実行がタイムアウトしました", retryable=True
             )
-        return self._conn.recv()
+        return self._recv(
+            "AGENT_SANDBOX_CRASHED",
+            "ステップ実行中にサンドボックスプロセスが予期せず終了しました",
+        )
 
     def save(self, path: str, timeout: int) -> dict:
         from app.main import JobError
 
-        self._conn.send({"cmd": "save", "path": path})
+        self._send({"cmd": "save", "path": path}, "サンドボックスへの保存コマンド送信に失敗しました")
         if not self._conn.poll(timeout):
             self.close()
             raise JobError(
                 "EXEC_TIMEOUT", "保存がタイムアウトしました", retryable=True
             )
-        return self._conn.recv()
+        return self._recv(
+            "AGENT_SANDBOX_CRASHED", "保存中にサンドボックスプロセスが予期せず終了しました"
+        )
 
     def close(self) -> None:
         try:
@@ -294,11 +374,13 @@ def run_agent(
     sandbox = AgentSandbox(working_path, sheet_name)
     transcript: list[dict[str, Any]] = []
     applied = 0
+    completed = False
     try:
         for step in range(1, max_steps + 1):
             text = llm.agent_step(summary, instruction, transcript)
             kind, code = parse_action(text)
             if kind == "done":
+                completed = True
                 break
             try:
                 precheck_step_code(code)
@@ -328,6 +410,15 @@ def run_agent(
                 }
             )
 
+        # DONE に到達せずステップ上限で打ち切った場合は、未完成の部分編集を
+        # そのまま保存せず、再試行可能なエラーにする。
+        if not completed:
+            raise JobError(
+                "AGENT_STEP_LIMIT",
+                f"ステップ上限({max_steps})に達しました。指示を分割するか "
+                "XLSX_AGENT_MAX_STEPS を増やして再実行してください。",
+                retryable=True,
+            )
         if applied == 0:
             raise JobError(
                 "AGENT_NO_CHANGES",

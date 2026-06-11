@@ -211,7 +211,7 @@ class LLMClient:
             "（os / sys / ファイル / ネットワークは不可）。"
             "説明・思考は書かない。\n"
             f"指示: {instruction}\n"
-            f"シート要約: {json.dumps(summary, ensure_ascii=False)[:2500]}\n"
+            f"シート要約: {json.dumps(summary, ensure_ascii=False)}\n"
             f"これまでの経過:{history if history else ' （なし。最初のステップ）'}\n"
         )
         return self._call_ollama(prompt)

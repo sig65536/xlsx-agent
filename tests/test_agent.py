@@ -6,7 +6,12 @@ import pytest
 from fastapi import UploadFile
 from openpyxl import Workbook, load_workbook
 
-from app.agent import parse_action, precheck_step_code, run_agent
+from app.agent import (
+    _is_allowed_import,
+    parse_action,
+    precheck_step_code,
+    run_agent,
+)
 from app.main import JobError, JobService
 
 
@@ -56,6 +61,41 @@ def test_precheck_rejects_escape() -> None:
         precheck_step_code("x = ws.__class__")
     with pytest.raises(JobError):
         precheck_step_code("open('/etc/passwd')")
+    # 許可モジュール経由の属性チェーン脱獄を遮断（os/sys/system を属性として禁止）
+    with pytest.raises(JobError):
+        precheck_step_code("import random\nrandom.os.system('whoami')")
+    with pytest.raises(JobError):
+        precheck_step_code("import os\nos.listdir('/')")
+    with pytest.raises(JobError):
+        precheck_step_code("x.subprocess.Popen(['ls'])")
+
+
+def test_import_whitelist_blocks_openpyxl_root_and_io() -> None:
+    # 書式系サブモジュールは許可
+    assert _is_allowed_import("openpyxl.styles") is True
+    assert _is_allowed_import("openpyxl.utils") is True
+    assert _is_allowed_import("datetime") is True
+    # openpyxl 直下（load_workbook 等のI/O経路）と危険モジュールは不許可
+    assert _is_allowed_import("openpyxl") is False
+    assert _is_allowed_import("openpyxl.reader.excel") is False
+    assert _is_allowed_import("os") is False
+    assert _is_allowed_import("subprocess") is False
+
+
+def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
+    """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
+
+    class NeverDoneLLM:
+        def agent_step(self, summary, instruction, transcript):
+            return "```python\nws['A1'] = 'x'\n```"
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    with pytest.raises(JobError) as err:
+        run_agent(
+            src, "Sheet", "テスト", {"sheet_name": "Sheet"}, NeverDoneLLM(), max_steps=2
+        )
+    assert err.value.error_code == "AGENT_STEP_LIMIT"
 
 
 def test_agent_multistep_edit(tmp_path: Path) -> None:

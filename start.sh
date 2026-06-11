@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xlsx-agent サーバー起動スクリプト（会社のサーバーPC / Linux 用）
+# xlsx-agent サーバー起動スクリプト（サーバーPC / Linux 用）
 #
 # 前提:
 #   - Python 3.10+ がインストール済み

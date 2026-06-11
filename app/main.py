@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -320,6 +321,43 @@ def _close_workbook(wb) -> None:
     wb.close()
 
 
+def validate_excel_file(path: Path, keep_vba: bool = True) -> None:
+    """保存後のxlsx/xlsmが壊れていないか検証する。
+
+    壊れたファイルをそのまま結果として渡さないための最終チェック。
+    zip構造（必須パートの存在）と openpyxl での再読込が通ることを確認する。
+    """
+    if not path.exists():
+        raise JobError("EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルが存在しません")
+    if path.stat().st_size == 0:
+        raise JobError("EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルが0バイトです")
+    if not zipfile.is_zipfile(path):
+        raise JobError(
+            "EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルがzip形式ではありません"
+        )
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+        for required in ("[Content_Types].xml", "xl/workbook.xml"):
+            if required not in names:
+                raise JobError(
+                    "EXCEL_SAVE_VALIDATION_FAILED", f"{required} がありません"
+                )
+    except JobError:
+        raise
+    except Exception as exc:
+        raise JobError(
+            "EXCEL_SAVE_VALIDATION_FAILED", f"zip検証に失敗しました: {exc}"
+        ) from exc
+    try:
+        wb = load_workbook(path, keep_vba=keep_vba, data_only=False)
+        _close_workbook(wb)
+    except Exception as exc:
+        raise JobError(
+            "EXCEL_SAVE_VALIDATION_FAILED", f"openpyxl再読込に失敗しました: {exc}"
+        ) from exc
+
+
 def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
     ws.unmerge_cells(merged_range)
     anchor = merged_range.split(":", 1)[0]
@@ -483,9 +521,18 @@ def _sandbox_runner(path: str, sheet_name: str, code: str, result_queue: Any) ->
             },
         }
         exec(compile(code, "<generated>", "exec"), safe_globals, safe_locals)
-        wb.save(path)
+        target = Path(path)
+        tmp_path = target.with_name(target.name + ".tmp")
+        wb.save(tmp_path)
         _close_workbook(wb)
+        # 壊れたファイルを採用しないよう、整合性検証後に原子的に差し替える。
+        validate_excel_file(tmp_path, keep_vba=True)
+        tmp_path.replace(target)
         result_queue.put({"ok": True})
+    except JobError as je:
+        result_queue.put(
+            {"ok": False, "error": je.message, "error_code": je.error_code}
+        )
     except Exception:
         result_queue.put({"ok": False, "error": traceback.format_exc()})
 
@@ -506,10 +553,11 @@ def _exec_in_sandbox(
         )
     result = q.get() if not q.empty() else {"ok": False, "error": "no result"}
     if not result.get("ok"):
+        error_code = result.get("error_code", "EXEC_RUNTIME_ERROR")
         raise JobError(
-            "EXEC_RUNTIME_ERROR",
+            error_code,
             f"実行エラー: {result.get('error', '')}",
-            retryable=True,
+            retryable=error_code != "EXCEL_SAVE_VALIDATION_FAILED",
         )
 
 

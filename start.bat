@@ -1,5 +1,5 @@
 @echo off
-REM xlsx-agent サーバー起動スクリプト（会社のサーバーPC / Windows 用）
+REM xlsx-agent サーバー起動スクリプト（サーバーPC / Windows 用）
 REM
 REM 前提:
 REM   - Python 3.10+ がインストール済み（py または python が使えること）

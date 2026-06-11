@@ -53,7 +53,10 @@ def test_parse_action_code_and_done() -> None:
     kind, code = parse_action("```python\nws['A1']=1\n```")
     assert kind == "code" and code == "ws['A1']=1"
     assert parse_action("DONE")[0] == "done"
-    assert parse_action("特に何もありません")[0] == "done"
+    assert parse_action("All set.\nDONE.")[0] == "done"
+    # 散文や "not done" は完了扱いにしない（部分保存を防ぐ）
+    assert parse_action("特に何もありません")[0] == "malformed"
+    assert parse_action("I am not done yet")[0] == "malformed"
 
 
 def test_precheck_rejects_escape() -> None:

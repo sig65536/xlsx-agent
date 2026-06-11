@@ -297,9 +297,14 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
                 with redirect_stdout(buf):
                     exec(compile(msg["code"], "<agent-step>", "exec"), namespace)
                 committed = _snapshot(namespace["wb"])  # 成功 → コミット
-                # 成功時のLLM定義変数も控えておく（ロールバック時に復元するため）
+                # 成功時のLLM定義変数も控えておく（ロールバック時に復元するため）。
+                # ただし openpyxl 由来のオブジェクト（Cell/Worksheet/Workbook 等）は
+                # ロールバックで破棄される古い wb を指してしまうので保持しない。
                 committed_vars = {
-                    k: v for k, v in namespace.items() if k not in reserved_keys
+                    k: v
+                    for k, v in namespace.items()
+                    if k not in reserved_keys
+                    and not type(v).__module__.startswith("openpyxl")
                 }
                 conn.send({"ok": True, "stdout": buf.getvalue()[-MAX_OBSERVATION_CHARS:]})
             except Exception:
@@ -452,16 +457,19 @@ class AgentSandbox:
 
 
 def parse_action(text: str) -> tuple[str, str]:
-    """LLM応答を (種別, コード) に解釈する。種別は 'code' か 'done'。"""
-    import re
+    """LLM応答を (種別, コード) に解釈する。種別は 'code' / 'done' / 'malformed'。
 
+    DONE は「単独行が DONE」のときのみ完了とみなす（部分文字列マッチだと
+    "not done" 等の散文を誤って完了扱いし、部分編集を保存してしまうため）。
+    """
     match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
     if match and match.group(1).strip():
         return "code", match.group(1).strip()
-    if "DONE" in text.upper():
-        return "done", ""
-    # コードもDONEも無い場合は、無限ループを避けるため done 扱いにする
-    return "done", ""
+    for line in text.strip().splitlines():
+        if line.strip().upper().rstrip(".!。 ") == "DONE":
+            return "done", ""
+    # コードも明示的な DONE も無い → 不正応答。完了扱いにせず再試行させる。
+    return "malformed", ""
 
 
 def run_agent(
@@ -487,6 +495,17 @@ def run_agent(
             if kind == "done":
                 completed = True
                 break
+            if kind == "malformed":
+                # 散文や不正応答は完了扱いにせず、コード or DONE を促して再試行
+                transcript.append(
+                    {
+                        "step": step,
+                        "code": "",
+                        "observation": "MALFORMED: ```python のコードブロック1つ、"
+                        "または完了なら DONE のみを返してください。",
+                    }
+                )
+                continue
             try:
                 precheck_step_code(code)
             except JobError as rejected:

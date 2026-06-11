@@ -837,6 +837,8 @@ class ChatSession:
     versions: list[Path]  # versions[0]=元ファイル, 末尾=現在の状態
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: float = 0.0
+    # 同一セッションへの同時操作（メッセージ送信/Undo）を直列化する
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class SessionService:
@@ -900,64 +902,67 @@ class SessionService:
     def post_message(
         self, session_id: str, instruction: str, think: bool | None = None
     ) -> dict[str, Any]:
-        session = self._get(session_id)
         if not instruction.strip():
             raise JobError("INVALID_STATE", "指示が空です")
-        current = session.versions[-1]
+        if self.mode == "oneshot":
+            raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
+        session = self._get(session_id)
+        # 同一セッションへの同時操作を直列化（version番号衝突や履歴破損を防ぐ）
+        with session.lock:
+            session.created_at = time.time()  # 利用中はTTLを延長
+            current = session.versions[-1]
 
-        wb = load_workbook(current, keep_vba=_keep_vba_for(current), data_only=False)
-        ws = (
-            wb[session.sheet_name]
-            if session.sheet_name and session.sheet_name in wb.sheetnames
-            else wb.active
-        )
-        sheet_name = ws.title
-        summary = _summarize_sheet(ws)
-        _close_workbook(wb)
-
-        candidate = session.work_dir / f"v{len(session.versions)}{session.ext}"
-        shutil.copy2(current, candidate)
-        try:
-            if self.mode == "oneshot":
-                raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
-            from app import agent
-
-            agent.run_agent(
-                candidate,
-                sheet_name,
-                self._augment(session, instruction),
-                summary,
-                self.llm,
-                max_steps=AGENT_MAX_STEPS,
-                step_timeout=AGENT_STEP_TIMEOUT,
-                think=think,
+            wb = load_workbook(current, keep_vba=_keep_vba_for(current), data_only=False)
+            ws = (
+                wb[session.sheet_name]
+                if session.sheet_name and session.sheet_name in wb.sheetnames
+                else wb.active
             )
-        except Exception:
-            candidate.unlink(missing_ok=True)
-            raise
+            sheet_name = ws.title
+            summary = _summarize_sheet(ws)
+            _close_workbook(wb)
 
-        preview = _create_preview(current, candidate, sheet_name)
-        with self.lock:
+            candidate = session.work_dir / f"v{len(session.versions)}{session.ext}"
+            shutil.copy2(current, candidate)
+            try:
+                from app import agent
+
+                agent.run_agent(
+                    candidate,
+                    sheet_name,
+                    self._augment(session, instruction),
+                    summary,
+                    self.llm,
+                    max_steps=AGENT_MAX_STEPS,
+                    step_timeout=AGENT_STEP_TIMEOUT,
+                    think=think,
+                )
+            except Exception:
+                candidate.unlink(missing_ok=True)
+                raise
+
+            preview = _create_preview(current, candidate, sheet_name)
             session.versions.append(candidate)
             # Undo 上限を超えた古い版は削除（先頭の元ファイルは残す）
             while len(session.versions) > CHAT_UNDO_LIMIT + 1:
                 old = session.versions.pop(1)
                 old.unlink(missing_ok=True)
             session.messages.append({"role": "user", "text": instruction})
-            session.messages.append(
-                {"role": "assistant", "preview": preview}
-            )
-        return {"preview": preview, "can_undo": len(session.versions) > 1}
+            session.messages.append({"role": "assistant", "preview": preview})
+            can_undo = len(session.versions) > 1
+        return {"preview": preview, "can_undo": can_undo}
 
     def undo(self, session_id: str) -> dict[str, Any]:
         session = self._get(session_id)
-        with self.lock:
+        with session.lock:
+            session.created_at = time.time()
             if len(session.versions) <= 1:
                 raise JobError("INVALID_STATE", "これ以上戻せません")
             removed = session.versions.pop()
             removed.unlink(missing_ok=True)
             session.messages.append({"role": "system", "text": "1手戻しました"})
-        return {"ok": True, "can_undo": len(session.versions) > 1}
+            can_undo = len(session.versions) > 1
+        return {"ok": True, "can_undo": can_undo}
 
     def current_path(self, session_id: str) -> Path:
         session = self._get(session_id)
@@ -978,13 +983,14 @@ class SessionService:
             now = time.time()
             with self.lock:
                 expired = [
-                    sid
-                    for sid, s in self.sessions.items()
+                    self.sessions.pop(sid)
+                    for sid, s in list(self.sessions.items())
                     if now - s.created_at > JOB_TTL_SECONDS
                 ]
-                for sid in expired:
-                    session = self.sessions.pop(sid, None)
-                    if session and session.work_dir.exists():
+            # 実行中のセッションを消さないよう、各セッションのロックを取ってから削除
+            for session in expired:
+                with session.lock:
+                    if session.work_dir.exists():
                         shutil.rmtree(session.work_dir, ignore_errors=True)
 
 

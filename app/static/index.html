@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>xlsx-agent — ローカルLLMでExcel編集</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #1a1d24;
+    --panel-2: #232733;
+    --border: #2e3340;
+    --text: #e7e9ee;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --accent-strong: #2f6fe0;
+    --ok: #3ecf8e;
+    --warn: #f0a020;
+    --err: #ff6b6b;
+    --add: #163a2b;
+    --del: #3a1d1d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, "Segoe UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 20px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .model { margin-left: auto; color: var(--muted); font-size: 12px; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .row > .col { flex: 1 1 200px; }
+  input[type=text], textarea {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 90px; }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  .drop {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 22px;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    background: var(--panel-2);
+  }
+  .drop.drag { border-color: var(--accent); background: #1d2a44; color: var(--text); }
+  .drop strong { color: var(--text); }
+  .file-pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 6px 12px; font-size: 13px; margin-top: 10px;
+  }
+  .file-pill button {
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px;
+  }
+  button.primary {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 11px 22px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.primary:hover { background: var(--accent-strong); }
+  button.primary:disabled { background: #3a4150; color: var(--muted); cursor: not-allowed; }
+  button.ghost {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 11px 18px; font-size: 14px; cursor: pointer;
+  }
+  button.ghost:hover { border-color: var(--accent); }
+  .actions { display: flex; gap: 12px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
+  .hidden { display: none !important; }
+  .status-line { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+  .spinner {
+    width: 16px; height: 16px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  .notice { font-size: 13px; padding: 10px 14px; border-radius: 8px; margin-top: 12px; }
+  .notice.err { background: var(--del); color: #ffd4d4; border: 1px solid #5a2a2a; }
+  .notice.info { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.cell { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--accent); white-space: nowrap; }
+  td.before { color: #ffb4b4; }
+  td.after { color: #9be6c4; }
+  .val-empty { color: var(--muted); font-style: italic; }
+  .summary { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 4px; }
+  .summary .num { font-size: 22px; font-weight: 700; }
+  .summary .lbl { font-size: 12px; color: var(--muted); }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--warn); }
+  footer { color: var(--muted); font-size: 12px; text-align: center; padding: 20px; }
+  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 xlsx-agent</h1>
+  <span class="sub">ローカルLLMでExcelを自然言語編集</span>
+  <span class="model" id="modelInfo"></span>
+</header>
+
+<main>
+  <!-- 入力フォーム -->
+  <section class="card" id="formCard">
+    <label>Excelファイル（.xlsx / .xlsm、最大20MB）</label>
+    <div class="drop" id="drop">
+      <div>ここにファイルをドラッグ＆ドロップ、または<strong>クリックして選択</strong></div>
+      <input type="file" id="fileInput" accept=".xlsx,.xlsm" class="hidden" />
+    </div>
+    <div id="filePillWrap"></div>
+
+    <div class="row" style="margin-top:18px;">
+      <div class="col">
+        <label>シート名（任意・空欄ならアクティブシート）</label>
+        <input type="text" id="sheetName" placeholder="例: 売上一覧" />
+      </div>
+    </div>
+
+    <div style="margin-top:18px;">
+      <label>編集指示（自然言語）</label>
+      <textarea id="instruction" placeholder="例: C列の売上を合計してC列の最終行の下に「合計」行を追加して"></textarea>
+    </div>
+
+    <div class="actions">
+      <button class="primary" id="submitBtn" disabled>編集を依頼</button>
+      <span class="status-line hidden" id="formStatus"></span>
+    </div>
+    <div id="formError"></div>
+  </section>
+
+  <!-- 進捗 -->
+  <section class="card hidden" id="progressCard">
+    <div class="status-line">
+      <span class="spinner" id="progressSpinner"></span>
+      <span id="progressText">処理中…</span>
+    </div>
+  </section>
+
+  <!-- プレビュー -->
+  <section class="card hidden" id="previewCard">
+    <div class="summary">
+      <div><div class="num" id="changeCount">0</div><div class="lbl">変更セル数</div></div>
+      <div><div class="num" id="sheetLbl">—</div><div class="lbl">対象シート</div></div>
+    </div>
+    <div id="previewNotes"></div>
+    <div style="overflow:auto; max-height: 460px;">
+      <table id="diffTable">
+        <thead><tr><th>セル</th><th>変更前</th><th>変更後</th></tr></thead>
+        <tbody id="diffBody"></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button class="primary" id="approveBtn">承認してダウンロード</button>
+      <button class="ghost" id="resetBtn">やり直す</button>
+      <span class="status-line hidden" id="approveStatus"></span>
+    </div>
+    <div id="approveError"></div>
+  </section>
+
+  <!-- 完了 -->
+  <section class="card hidden" id="doneCard">
+    <div class="status-line"><span class="badge ok">完了</span><span>編集済みファイルをダウンロードしました。</span></div>
+    <div class="actions">
+      <button class="ghost" id="newJobBtn">新しい編集を始める</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  サーバーで処理され、承認するまで元ファイルは書き換わりません。ダウンロードURLは一度きり有効です。
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STATUS_LABEL = {
+  queued: "順番待ち…", analyzing: "シート構造を解析中…", generating: "LLMが編集コードを生成中…",
+  checking: "生成コードを安全性チェック中…", executing: "編集を適用中…",
+  preview_ready: "プレビュー準備完了", approved: "承認済み", done: "完了", error: "エラー",
+};
+
+let selectedFile = null;
+let pollTimer = null;
+
+function fmtVal(v) {
+  if (v === null || v === undefined || v === "") return '<span class="val-empty">（空）</span>';
+  return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function showError(el, msg, retryable) {
+  el.innerHTML = `<div class="notice err">⚠️ ${msg}${retryable ? '<br><small>※ もう一度試すと成功する可能性があります（retryable）。</small>' : ''}</div>`;
+}
+function clearError(el) { el.innerHTML = ""; }
+
+// ファイル選択
+function setFile(file) {
+  if (!file) return;
+  const ok = /\.(xlsx|xlsm)$/i.test(file.name);
+  if (!ok) { showError($("formError"), "対応形式は .xlsx / .xlsm のみです。"); return; }
+  if (file.size > 20 * 1024 * 1024) { showError($("formError"), "ファイルサイズが20MBを超えています。"); return; }
+  clearError($("formError"));
+  selectedFile = file;
+  $("filePillWrap").innerHTML =
+    `<span class="file-pill">📄 ${file.name} <small>(${(file.size/1024).toFixed(0)} KB)</small> <button id="clearFile" title="削除">✕</button></span>`;
+  $("clearFile").onclick = (e) => { e.stopPropagation(); selectedFile = null; $("filePillWrap").innerHTML = ""; updateSubmit(); };
+  updateSubmit();
+}
+function updateSubmit() {
+  $("submitBtn").disabled = !(selectedFile && $("instruction").value.trim());
+}
+
+const drop = $("drop");
+drop.onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => setFile(e.target.files[0]);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("drag"); };
+drop.ondragleave = () => drop.classList.remove("drag");
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("drag"); setFile(e.dataTransfer.files[0]); };
+$("instruction").oninput = updateSubmit;
+
+// 送信
+$("submitBtn").onclick = async () => {
+  clearError($("formError"));
+  const fd = new FormData();
+  fd.append("file", selectedFile);
+  fd.append("instruction", $("instruction").value.trim());
+  const sn = $("sheetName").value.trim();
+  if (sn) fd.append("sheet_name", sn);
+
+  $("submitBtn").disabled = true;
+  $("formStatus").classList.remove("hidden");
+  $("formStatus").innerHTML = '<span class="spinner"></span><span>送信中…</span>';
+  try {
+    const res = await fetch("jobs", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) {
+      const d = data.detail || data;
+      showError($("formError"), d.message || "送信に失敗しました。", d.retryable);
+      $("submitBtn").disabled = false;
+      $("formStatus").classList.add("hidden");
+      return;
+    }
+    $("formCard").classList.add("hidden");
+    $("progressCard").classList.remove("hidden");
+    pollJob(data.job_id);
+  } catch (err) {
+    showError($("formError"), "サーバーに接続できませんでした: " + err.message);
+    $("submitBtn").disabled = false;
+    $("formStatus").classList.add("hidden");
+  }
+};
+
+// ポーリング
+function pollJob(jobId) {
+  const tick = async () => {
+    try {
+      const res = await fetch("jobs/" + jobId);
+      if (!res.ok) throw new Error("ジョブが見つかりません");
+      const job = await res.json();
+      $("progressText").textContent = STATUS_LABEL[job.status] || job.status;
+      if (job.status === "error") {
+        clearTimeout(pollTimer);
+        $("progressCard").classList.add("hidden");
+        $("formCard").classList.remove("hidden");
+        $("submitBtn").disabled = false;
+        $("formStatus").classList.add("hidden");
+        showError($("formError"), `[${job.error_code}] ${job.message}`, job.retryable);
+        return;
+      }
+      if (job.status === "preview_ready" && job.preview) {
+        clearTimeout(pollTimer);
+        renderPreview(jobId, job.preview);
+        return;
+      }
+    } catch (err) {
+      clearTimeout(pollTimer);
+      $("progressText").textContent = "通信エラー: " + err.message;
+      return;
+    }
+    pollTimer = setTimeout(tick, 1500);
+  };
+  tick();
+}
+
+// プレビュー描画
+function renderPreview(jobId, preview) {
+  $("progressCard").classList.add("hidden");
+  $("previewCard").classList.remove("hidden");
+  $("changeCount").textContent = preview.changed_cell_count;
+  $("sheetLbl").textContent = preview.sheet_name || "—";
+
+  const shown = preview.changed_cells || [];
+  const truncated = preview.changed_cell_count > shown.length;
+  $("previewNotes").innerHTML =
+    `<div class="notice info">${(preview.notes || []).join(" / ")}` +
+    (truncated ? `<br>表示は先頭 ${shown.length} 件です（全 ${preview.changed_cell_count} 件）。` : "") +
+    `</div>`;
+
+  const body = $("diffBody");
+  body.innerHTML = "";
+  if (shown.length === 0) {
+    body.innerHTML = '<tr><td colspan="3" class="val-empty">変更はありませんでした。</td></tr>';
+  }
+  for (const c of shown) {
+    const styleTag = c.style_changed ? '<span class="tag">書式変更</span>' : "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="cell">${c.cell}${styleTag}</td>` +
+                   `<td class="before">${fmtVal(c.before)}</td>` +
+                   `<td class="after">${fmtVal(c.after)}</td>`;
+    body.appendChild(tr);
+  }
+
+  $("approveBtn").onclick = () => approveJob(jobId);
+}
+
+// 承認 → ダウンロード
+async function approveJob(jobId) {
+  clearError($("approveError"));
+  $("approveBtn").disabled = true;
+  $("approveStatus").classList.remove("hidden");
+  $("approveStatus").innerHTML = '<span class="spinner"></span><span>確定中…</span>';
+  try {
+    const res = await fetch(`jobs/${jobId}/approve`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      showError($("approveError"), data.detail || "承認に失敗しました。");
+      $("approveBtn").disabled = false;
+      $("approveStatus").classList.add("hidden");
+      return;
+    }
+    // 一度きりのトークンURL。リンク経由でダウンロードを発火。
+    const a = document.createElement("a");
+    a.href = data.download_url;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    $("previewCard").classList.add("hidden");
+    $("doneCard").classList.remove("hidden");
+  } catch (err) {
+    showError($("approveError"), "ダウンロードに失敗しました: " + err.message);
+    $("approveBtn").disabled = false;
+    $("approveStatus").classList.add("hidden");
+  }
+}
+
+// リセット
+function resetAll() {
+  clearTimeout(pollTimer);
+  selectedFile = null;
+  $("fileInput").value = "";
+  $("filePillWrap").innerHTML = "";
+  $("instruction").value = "";
+  $("sheetName").value = "";
+  clearError($("formError")); clearError($("approveError"));
+  $("formStatus").classList.add("hidden");
+  $("approveStatus").classList.add("hidden");
+  $("approveBtn").disabled = false;
+  $("previewCard").classList.add("hidden");
+  $("doneCard").classList.add("hidden");
+  $("progressCard").classList.add("hidden");
+  $("formCard").classList.remove("hidden");
+  updateSubmit();
+}
+$("resetBtn").onclick = resetAll;
+$("newJobBtn").onclick = resetAll;
+
+// モデル情報表示
+fetch("healthz").then(r => r.json()).then(d => {
+  if (d.model) $("modelInfo").textContent = "model: " + d.model;
+}).catch(() => {});
+</script>
+</body>
+</html>

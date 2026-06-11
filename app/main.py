@@ -14,12 +14,16 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from openpyxl import load_workbook
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
@@ -75,6 +79,43 @@ class LLMClient:
         )
         self.model = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+        self._resolved_model: str | None = None
+
+    @property
+    def _tags_endpoint(self) -> str:
+        base = self.endpoint.rsplit("/api/", 1)[0]
+        return f"{base}/api/tags"
+
+    def _list_models(self) -> list[str]:
+        req = Request(self._tags_endpoint, method="GET")
+        with urlopen(req, timeout=self.timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+
+    def resolve_model(self) -> str:
+        """設定モデル名を、実際にOllamaへ入っているタグ名に解決する。
+
+        `ollama pull gemma4` は `gemma4:latest`、`ollama pull gemma4:e4b` は
+        `gemma4:e4b` という名前で保存されるため、設定値とインストール名が
+        食い違うと404になる。ベース名(gemma4)が一致するタグへ自動で寄せる。
+        """
+        if self._resolved_model:
+            return self._resolved_model
+        try:
+            installed = self._list_models()
+        except (URLError, OSError, ValueError):
+            return self.model  # 取得失敗時は設定値のまま試す
+        if not installed or self.model in installed:
+            self._resolved_model = self.model
+            return self.model
+        base = self.model.split(":", 1)[0]
+        for candidate in (f"{base}:e4b", f"{base}:latest", base):
+            if candidate in installed:
+                self._resolved_model = candidate
+                return candidate
+        same_base = [m for m in installed if m.split(":", 1)[0] == base]
+        self._resolved_model = same_base[0] if same_base else self.model
+        return self._resolved_model
 
     def generate_code(
         self, summary: dict[str, Any], instruction: str, feedback: str = ""
@@ -89,8 +130,9 @@ class LLMClient:
             f"instruction={instruction}\n"
             f"feedback={feedback}\n"
         )
+        model = self.resolve_model()
         body = {
-            "model": self.model,
+            "model": model,
             "stream": False,
             "prompt": prompt,
             "options": {"temperature": 0.1},
@@ -105,6 +147,23 @@ class LLMClient:
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8")[:300]
+            except Exception:  # pragma: no cover - 補助的な詳細取得のみ
+                pass
+            if exc.code == 404:
+                raise JobError(
+                    "LLM_MODEL_NOT_FOUND",
+                    f"Ollamaにモデル '{model}' が見つかりません。"
+                    f"サーバーで `ollama pull {self.model}` を実行してください。{detail}",
+                ) from exc
+            raise JobError(
+                "LLM_HTTP_ERROR",
+                f"LLM呼び出しがHTTP {exc.code} を返しました: {detail}",
+                retryable=True,
+            ) from exc
         except URLError as exc:
             raise JobError(
                 "LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True
@@ -681,6 +740,29 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
     app = FastAPI(title="xlsx-agent", version="0.1")
     service = job_service or JobService(Path(os.getenv("JOB_ROOT", "./data/jobs")))
 
+    # ブラウザ（別PC）からのアクセスを許可する。
+    # 既定は全許可。社内LAN限定にしたい場合は CORS_ORIGINS にカンマ区切りで指定。
+    cors_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins or ["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok", "model": service.llm.model}
+
+    @app.get("/", include_in_schema=False)
+    async def index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
     @app.post("/jobs")
     async def create_job(
         file: UploadFile = File(...),
@@ -729,6 +811,9 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
             )
         except KeyError as err:
             raise HTTPException(status_code=404, detail="token not found") from err
+
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     return app
 

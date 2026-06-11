@@ -837,6 +837,8 @@ class ChatSession:
     versions: list[Path]  # versions[0]=元ファイル, 末尾=現在の状態
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: float = 0.0
+    # 版ファイル名の一意採番（list長だとUndo上限トリム後に番号が衝突する）
+    version_counter: int = 0
     # 同一セッションへの同時操作（メッセージ送信/Undo）を直列化する
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -922,7 +924,8 @@ class SessionService:
             summary = _summarize_sheet(ws)
             _close_workbook(wb)
 
-            candidate = session.work_dir / f"v{len(session.versions)}{session.ext}"
+            session.version_counter += 1
+            candidate = session.work_dir / f"v{session.version_counter}{session.ext}"
             shutil.copy2(current, candidate)
             try:
                 from app import agent
@@ -960,7 +963,12 @@ class SessionService:
                 raise JobError("INVALID_STATE", "これ以上戻せません")
             removed = session.versions.pop()
             removed.unlink(missing_ok=True)
-            session.messages.append({"role": "system", "text": "1手戻しました"})
+            # 取り消した手の user/assistant メッセージも履歴から除く
+            # （残すと _augment が取り消し済みの指示を文脈に含めてしまう）
+            if session.messages and session.messages[-1].get("role") == "assistant":
+                session.messages.pop()
+            if session.messages and session.messages[-1].get("role") == "user":
+                session.messages.pop()
             can_undo = len(session.versions) > 1
         return {"ok": True, "can_undo": can_undo}
 

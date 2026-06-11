@@ -357,11 +357,36 @@ def test_chat_session_flow_and_undo(tmp_path: Path) -> None:
     assert wb.active["A1"].value == "hi"
     wb.close()
 
-    # Undo で元に戻る
+    # Undo で元に戻り、取り消した指示は履歴からも消える
     svc.undo(sid)
     wb2 = load_workbook(svc.current_path(sid))
     assert wb2.active["A1"].value == "before"
     wb2.close()
+    session = svc._get(sid)
+    assert not any(m.get("role") == "user" for m in session.messages)
+
+
+def test_chat_undo_limit_no_filename_collision(tmp_path: Path, monkeypatch) -> None:
+    """Undo上限トリム後も版ファイル名が衝突しない（SameFileError回帰）。"""
+    import app.main as main
+
+    monkeypatch.setattr(main, "CHAT_UNDO_LIMIT", 2)
+
+    class Stub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            if not transcript:
+                return "```python\nws.cell(row=ws.max_row + 1, column=1, value=1)\n```"
+            return "DONE"
+
+    svc = main.SessionService(tmp_path / "s", llm=Stub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+    for _ in range(5):  # 上限(2)を超えてトリムを発生させる
+        svc.post_message(sid, "1行追加")
+    session = svc._get(sid)
+    assert len(session.versions) == main.CHAT_UNDO_LIMIT + 1  # トリム済み
+    assert len(set(session.versions)) == len(session.versions)  # 名前衝突なし
+    assert all(p.exists() for p in session.versions)
 
 
 def test_chat_session_serializes_concurrent_messages(tmp_path: Path) -> None:

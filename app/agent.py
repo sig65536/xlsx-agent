@@ -379,7 +379,7 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
         )
 
         # import 完了後に OS レベルの隔離を適用（ネットワーク遮断・env スクラブ・
-        # POSIXのリソース上限/権限ドロップ）。未対応OSでは該当部分が no-op。
+        # POSIXのリソース上限）。未対応OSでは該当部分が no-op。
         _harden_worker_process()
 
         keep_vba = _keep_vba_for(input_path)

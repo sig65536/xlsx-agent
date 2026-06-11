@@ -11,7 +11,6 @@ import threading
 import time
 import traceback
 import uuid
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,7 +21,15 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+
+from app.common import (
+    JobError,
+    _close_workbook,
+    _keep_vba_for,
+    _safe_set_merged_value,
+    validate_excel_file,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -30,6 +37,10 @@ ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 JOB_TTL_SECONDS = 3600
 LLM_MAX_RETRY = 3
+# 編集方式: "agent"（ReActループ・既定）/ "oneshot"（単発コード生成）
+AGENT_DEFAULT_MODE = os.getenv("XLSX_AGENT_MODE", "agent").lower()
+AGENT_MAX_STEPS = int(os.getenv("XLSX_AGENT_MAX_STEPS", "6"))
+AGENT_STEP_TIMEOUT = int(os.getenv("XLSX_AGENT_STEP_TIMEOUT", "30"))
 SUMMARY_FORMULA_MAX_ROWS = 200
 SUMMARY_FORMULA_MAX_COLS = 50
 PREVIEW_MAX_CHANGED_CELLS = 500
@@ -46,14 +57,6 @@ class JobStatus:
     APPROVED = "approved"
     DONE = "done"
     ERROR = "error"
-
-
-class JobError(Exception):
-    def __init__(self, error_code: str, message: str, retryable: bool = False):
-        self.error_code = error_code
-        self.message = message
-        self.retryable = retryable
-        super().__init__(message)
 
 
 @dataclass
@@ -118,19 +121,8 @@ class LLMClient:
         self._resolved_model = same_base[0] if same_base else self.model
         return self._resolved_model
 
-    def generate_code(
-        self, summary: dict[str, Any], instruction: str, feedback: str = ""
-    ) -> str:
-        prompt = (
-            "あなたはExcel編集用Pythonコード生成器です。"
-            "出力は```python ... ```のコードブロック1つだけにしてください。"
-            "説明文、思考過程、Markdown本文、箇条書きは禁止です。"
-            "使用可能な変数は wb, ws, helpers のみです。"
-            "import / open / exec / eval / ファイルI/O / ネットワーク / OS操作は禁止です。\n"
-            f"sheet_summary={json.dumps(summary, ensure_ascii=False)}\n"
-            f"instruction={instruction}\n"
-            f"feedback={feedback}\n"
-        )
+    def _call_ollama(self, prompt: str) -> str:
+        """Ollama の generate API を叩き、response テキストを返す。"""
         model = self.resolve_model()
         body = {
             "model": model,
@@ -169,11 +161,59 @@ class LLMClient:
             raise JobError(
                 "LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True
             ) from exc
-        text = payload.get("response", "")
+        return payload.get("response", "")
+
+    @staticmethod
+    def _extract_code(text: str) -> str:
         match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
         if match:
             return match.group(1).strip()
         return text.strip()
+
+    def generate_code(
+        self, summary: dict[str, Any], instruction: str, feedback: str = ""
+    ) -> str:
+        prompt = (
+            "あなたはExcel編集用Pythonコード生成器です。"
+            "出力は```python ... ```のコードブロック1つだけにしてください。"
+            "説明文、思考過程、Markdown本文、箇条書きは禁止です。"
+            "使用可能な変数は wb, ws, helpers のみです。"
+            "import / open / exec / eval / ファイルI/O / ネットワーク / OS操作は禁止です。\n"
+            f"sheet_summary={json.dumps(summary, ensure_ascii=False)}\n"
+            f"instruction={instruction}\n"
+            f"feedback={feedback}\n"
+        )
+        return self._extract_code(self._call_ollama(prompt))
+
+    def agent_step(
+        self,
+        summary: dict[str, Any],
+        instruction: str,
+        transcript: list[dict[str, Any]],
+    ) -> str:
+        """ReActエージェントの1ターン分の生応答（コードブロック or DONE）を返す。"""
+        history = ""
+        for item in transcript[-4:]:
+            history += (
+                f"\n# step {item['step']} のコード:\n{item['code']}\n"
+                f"# 実行結果:\n{item['observation']}\n"
+            )
+        prompt = (
+            "あなたはopenpyxlでExcelを編集するエージェントです。"
+            f"変数 wb(Workbook), ws(対象シート '{summary.get('sheet_name', '')}'), "
+            "helpers が使えます。\n"
+            "各ターンの応答は次のどちらか一つだけ:\n"
+            "  1) 次に実行するコードを ```python ... ``` で1ブロック"
+            "（print()で値を確認してよい）\n"
+            "  2) 指示が完了したら DONE の一語のみ\n"
+            "import可能: datetime, re, math, openpyxl.styles 等"
+            "（os / sys / ファイル / ネットワークは不可）。"
+            "説明・思考は書かない。\n"
+            f"指示: {instruction}\n"
+            f"シート要約: {json.dumps(summary, ensure_ascii=False)}\n"
+            f"これまでの経過:{history if history else ' （なし。最初のステップ）'}\n"
+        )
+        return self._call_ollama(prompt)
 
 
 class CodeChecker:
@@ -311,100 +351,6 @@ class CodeChecker:
             column, rem = divmod(column - 1, 26)
             out = chr(65 + rem) + out
         return out
-
-
-def _close_workbook(wb) -> None:
-    vba_archive = getattr(wb, "vba_archive", None)
-    if vba_archive is not None:
-        vba_archive.close()
-        wb.vba_archive = None
-    wb.close()
-
-
-def _keep_vba_for(path) -> bool:
-    """VBA保持の要否を拡張子から決める。
-
-    .xlsm のみ keep_vba=True にする。plain .xlsx を keep_vba=True で保存すると
-    openpyxl がブックの content-type を macroEnabled (=.xlsm用) にしてしまい、
-    拡張子 .xlsx と矛盾して Excel が「破損」と判断する。拡張子に合わせるのが正解。
-    """
-    return str(path).lower().endswith(".xlsm")
-
-
-def _workbook_content_type(path: Path) -> str:
-    """[Content_Types].xml から /xl/workbook.xml のContentTypeを取り出す。"""
-    with zipfile.ZipFile(path) as zf:
-        content_types = zf.read("[Content_Types].xml").decode("utf-8", "ignore")
-    match = re.search(
-        r'PartName="/xl/workbook\.xml"[^>]*ContentType="([^"]+)"', content_types
-    )
-    return match.group(1) if match else ""
-
-
-def validate_excel_file(path: Path) -> None:
-    """保存後のxlsx/xlsmが壊れていないか検証する。
-
-    壊れたファイルをそのまま結果として渡さないための最終チェック。
-    - zip構造（必須パートの存在）
-    - 拡張子と content-type の一致（.xlsx なのに macroEnabled になっていない等）
-    - openpyxl での再読込
-
-    ※ content-type の不一致は openpyxl では開けてしまうため、Excel だけが弾く
-      「開けないファイル」を検出するにはこのチェックが必須。
-    """
-    ext = path.suffix.lower()
-    keep_vba = ext == ".xlsm"
-    expect_macro = ext == ".xlsm"
-
-    if not path.exists():
-        raise JobError("EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルが存在しません")
-    if path.stat().st_size == 0:
-        raise JobError("EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルが0バイトです")
-    if not zipfile.is_zipfile(path):
-        raise JobError(
-            "EXCEL_SAVE_VALIDATION_FAILED", "出力ファイルがzip形式ではありません"
-        )
-    try:
-        with zipfile.ZipFile(path) as zf:
-            names = set(zf.namelist())
-        for required in ("[Content_Types].xml", "xl/workbook.xml"):
-            if required not in names:
-                raise JobError(
-                    "EXCEL_SAVE_VALIDATION_FAILED", f"{required} がありません"
-                )
-        workbook_ct = _workbook_content_type(path)
-        is_macro_ct = "macroEnabled" in workbook_ct
-        if expect_macro and not is_macro_ct:
-            raise JobError(
-                "EXCEL_SAVE_VALIDATION_FAILED",
-                ".xlsm なのにマクロ有効ブックのcontent-typeになっていません",
-            )
-        if not expect_macro and is_macro_ct:
-            raise JobError(
-                "EXCEL_SAVE_VALIDATION_FAILED",
-                ".xlsx なのにマクロ有効ブックのcontent-typeになっています"
-                "（keep_vba誤用によるExcel破損）",
-            )
-    except JobError:
-        raise
-    except Exception as exc:
-        raise JobError(
-            "EXCEL_SAVE_VALIDATION_FAILED", f"zip検証に失敗しました: {exc}"
-        ) from exc
-    try:
-        wb = load_workbook(path, keep_vba=keep_vba, data_only=False)
-        _close_workbook(wb)
-    except Exception as exc:
-        raise JobError(
-            "EXCEL_SAVE_VALIDATION_FAILED", f"openpyxl再読込に失敗しました: {exc}"
-        ) from exc
-
-
-def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
-    ws.unmerge_cells(merged_range)
-    anchor = merged_range.split(":", 1)[0]
-    ws[anchor] = value
-    ws.merge_cells(merged_range)
 
 
 def _summary_value(value: Any) -> Any:
@@ -604,26 +550,19 @@ def _exec_in_sandbox(
         )
 
 
-def _create_preview(
-    before_path: Path, after_path: Path, sheet_name: str
-) -> dict[str, Any]:
-    before = load_workbook(
-        before_path, keep_vba=_keep_vba_for(before_path), data_only=False
-    )
-    after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
-    ws_before = before[sheet_name]
-    ws_after = after[sheet_name]
+def _diff_sheet(ws_before, ws_after, sheet_name: str) -> list[dict[str, Any]]:
     max_row = max(ws_before.max_row, ws_after.max_row)
     max_col = max(ws_before.max_column, ws_after.max_column)
-    changed_cells = []
+    changes = []
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             c1 = ws_before.cell(row=row, column=col)
             c2 = ws_after.cell(row=row, column=col)
             if c1.value != c2.value or c1.style_id != c2.style_id:
                 coord = f"{CodeChecker._col_letters(col)}{row}"
-                changed_cells.append(
+                changes.append(
                     {
+                        "sheet": sheet_name,
                         "cell": coord,
                         "before": c1.value,
                         "after": c2.value,
@@ -636,21 +575,60 @@ def _create_preview(
                         "style_changed": c1.style_id != c2.style_id,
                     }
                 )
-    _close_workbook(before)
-    _close_workbook(after)
+    return changes
+
+
+def _create_preview(
+    before_path: Path, after_path: Path, sheet_name: str
+) -> dict[str, Any]:
+    before = load_workbook(
+        before_path, keep_vba=_keep_vba_for(before_path), data_only=False
+    )
+    after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
+    changed_cells: list[dict[str, Any]] = []
+    notes = [PREVIEW_FORMULA_NOTE]
+    try:
+        # 全シートを比較する。エージェントは他シートも編集できるため、対象シート
+        # だけ差分を取ると「見ていない変更」をユーザーが承認してしまう。
+        before_names = set(before.sheetnames)
+        after_names = set(after.sheetnames)
+
+        # 対象シートを先頭に、それ以外を後ろに並べて差分を取る
+        common = [n for n in after.sheetnames if n in before_names]
+        common.sort(key=lambda n: (n != sheet_name, n))
+        for name in common:
+            changed_cells.extend(_diff_sheet(before[name], after[name], name))
+
+        added = [n for n in after.sheetnames if n not in before_names]
+        removed = [n for n in before.sheetnames if n not in after_names]
+        if added:
+            empty_ws = Workbook().active  # 空シート基準に新規シートの内容を差分表示
+            for name in added:
+                changed_cells.extend(_diff_sheet(empty_ws, after[name], name))
+                notes.append(f"シート「{name}」が新規追加されました。")
+        for name in removed:
+            notes.append(f"シート「{name}」が削除されました。")
+    finally:
+        # 差分中に例外が出ても FD を確実に解放する
+        _close_workbook(before)
+        _close_workbook(after)
     return {
         "sheet_name": sheet_name,
+        "sheets_changed": sorted({c["sheet"] for c in changed_cells}),
         "changed_cell_count": len(changed_cells),
         "changed_cells": changed_cells[:PREVIEW_MAX_CHANGED_CELLS],
-        "notes": [PREVIEW_FORMULA_NOTE],
+        "notes": notes,
     }
 
 
 class JobService:
-    def __init__(self, root_dir: Path, llm: LLMClient | None = None) -> None:
+    def __init__(
+        self, root_dir: Path, llm: LLMClient | None = None, mode: str | None = None
+    ) -> None:
         self.root_dir = root_dir
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.llm = llm or LLMClient()
+        self.mode = (mode or AGENT_DEFAULT_MODE).lower()
         self.checker = CodeChecker()
         self.jobs: dict[str, Job] = {}
         self.download_tokens: dict[str, Path] = {}
@@ -734,6 +712,42 @@ class JobService:
             finally:
                 self.q.task_done()
 
+    def _run_oneshot(
+        self,
+        job: Job,
+        summary: dict[str, Any],
+        blocked_cells: set[str],
+        sheet_name: str,
+        result_path: Path,
+    ) -> None:
+        """単発モード: コードを1回生成→ASTチェック→サンドボックス実行。"""
+        feedback = ""
+        validation_errors: list[str] = []
+        for _ in range(LLM_MAX_RETRY):
+            job.status = JobStatus.GENERATING
+            generated_code = self.llm.generate_code(
+                summary, job.instruction, feedback=feedback
+            )
+            job.status = JobStatus.CHECKING
+            try:
+                self.checker.validate(generated_code, blocked_cells)
+                break
+            except JobError as err:
+                feedback = f"{err.error_code}: {err.message}"
+                validation_errors.append(feedback)
+        else:
+            reason = (
+                "; ".join(validation_errors)
+                if validation_errors
+                else "コード生成に失敗しました（検証詳細なし）"
+            )
+            raise JobError(
+                "CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}"
+            )
+
+        job.status = JobStatus.EXECUTING
+        _exec_in_sandbox(result_path, sheet_name, generated_code)
+
     def _process(self, job_id: str) -> None:
         job = self.get_job(job_id)
         try:
@@ -751,35 +765,25 @@ class JobService:
             blocked_cells = _non_anchor_cells(ws)
             _close_workbook(wb)
 
-            generated_code = ""
-            feedback = ""
-            validation_errors: list[str] = []
-            for _ in range(LLM_MAX_RETRY):
-                job.status = JobStatus.GENERATING
-                generated_code = self.llm.generate_code(
-                    summary, job.instruction, feedback=feedback
-                )
-                job.status = JobStatus.CHECKING
-                try:
-                    self.checker.validate(generated_code, blocked_cells)
-                    break
-                except JobError as err:
-                    feedback = f"{err.error_code}: {err.message}"
-                    validation_errors.append(feedback)
-            else:
-                reason = (
-                    "; ".join(validation_errors)
-                    if validation_errors
-                    else "コード生成に失敗しました（検証詳細なし）"
-                )
-                raise JobError(
-                    "CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}"
-                )
-
-            job.status = JobStatus.EXECUTING
             result_path = job.work_dir / f"result{job.source_path.suffix}"
             shutil.copy2(job.source_path, result_path)
-            _exec_in_sandbox(result_path, sheet_name, generated_code)
+
+            if self.mode == "oneshot":
+                self._run_oneshot(job, summary, blocked_cells, sheet_name, result_path)
+            else:
+                from app import agent
+
+                job.status = JobStatus.GENERATING
+                agent.run_agent(
+                    result_path,
+                    sheet_name,
+                    job.instruction,
+                    summary,
+                    self.llm,
+                    max_steps=AGENT_MAX_STEPS,
+                    step_timeout=AGENT_STEP_TIMEOUT,
+                )
+
             job.preview = _create_preview(job.source_path, result_path, sheet_name)
             job.result_path = result_path
             job.status = JobStatus.PREVIEW_READY

@@ -120,6 +120,16 @@
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--warn); }
   footer { color: var(--muted); font-size: 12px; text-align: center; padding: 20px; }
   code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .caps { margin-top: 14px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+  .caps > summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  .caps > summary:hover { color: var(--text); }
+  .caps-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 10px; }
+  .caps-grid > div { flex: 1 1 240px; }
+  .caps-h { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .caps-h.ok { color: var(--ok); }
+  .caps-h.ng { color: var(--err); }
+  .caps-grid ul { margin: 0; padding-left: 18px; }
+  .caps-grid li { font-size: 12.5px; color: var(--text); margin: 3px 0; }
 </style>
 </head>
 <body>
@@ -150,6 +160,39 @@
       <label>編集指示（自然言語）</label>
       <textarea id="instruction" placeholder="例: C列の売上を合計してC列の最終行の下に「合計」行を追加して"></textarea>
     </div>
+
+    <details class="caps">
+      <summary>このツールでできること / できないこと</summary>
+      <div class="caps-grid">
+        <div>
+          <div class="caps-h ok">✅ できること</div>
+          <ul>
+            <li>値の編集・一括置換・条件付きの書き換え</li>
+            <li>行・列の追加 / 削除 / 並べ替え</li>
+            <li>集計（合計・平均・最大最小・件数）と数式の挿入</li>
+            <li>書式：太字・斜体・文字色・背景色・罫線・配置</li>
+            <li>表示形式（カンマ・通貨・日付など）、列幅・行高</li>
+            <li>セルの結合 / 解除、セルにコメント追加</li>
+            <li>複数シートの操作（シート追加・シート間コピー）</li>
+            <li>条件付き書式、Excelテーブル化、基本的なグラフ（棒・折れ線・円）</li>
+          </ul>
+        </div>
+        <div>
+          <div class="caps-h ng">🚫 できないこと</div>
+          <ul>
+            <li>ピボットテーブルの作成</li>
+            <li>マクロ / VBA の作成・実行（既存マクロは保持のみ）</li>
+            <li>画像・図形の挿入</li>
+            <li>数式の「計算結果の値」表示（数式は入りますが、計算はExcelで開いた時。プレビューは数式の文字列）</li>
+            <li>外部データ取得・Web連携・他システム接続</li>
+            <li>複数ファイルの結合（1回につき1ファイル）</li>
+            <li>20MBを超えるファイル</li>
+            <li>元ファイルにピボット・画像など特殊機能がある場合、保存時に失われることがあります</li>
+            <li>複雑すぎる多段の指示は失敗することがあります（指示は分割推奨）</li>
+          </ul>
+        </div>
+      </div>
+    </details>
 
     <div class="actions">
       <button class="primary" id="submitBtn" disabled>編集を依頼</button>
@@ -314,7 +357,8 @@ function renderPreview(jobId, preview) {
   $("progressCard").classList.add("hidden");
   $("previewCard").classList.remove("hidden");
   $("changeCount").textContent = preview.changed_cell_count;
-  $("sheetLbl").textContent = preview.sheet_name || "—";
+  const sheetsChanged = preview.sheets_changed || [];
+  $("sheetLbl").textContent = sheetsChanged.length ? sheetsChanged.join(", ") : (preview.sheet_name || "—");
 
   const shown = preview.changed_cells || [];
   const truncated = preview.changed_cell_count > shown.length;
@@ -331,7 +375,9 @@ function renderPreview(jobId, preview) {
   for (const c of shown) {
     const styleTag = c.style_changed ? '<span class="tag">書式変更</span>' : "";
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td class="cell">${c.cell}${styleTag}</td>` +
+    const rawLabel = c.sheet ? `${c.sheet}!${c.cell}` : c.cell;
+    const cellLabel = fmtVal(rawLabel);  // シート名はファイル由来なのでHTMLエスケープ必須
+    tr.innerHTML = `<td class="cell">${cellLabel}${styleTag}</td>` +
                    `<td class="before">${fmtVal(c.before)}</td>` +
                    `<td class="after">${fmtVal(c.after)}</td>`;
     body.appendChild(tr);

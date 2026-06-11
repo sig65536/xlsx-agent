@@ -30,6 +30,10 @@ ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 JOB_TTL_SECONDS = 3600
 LLM_MAX_RETRY = 3
+# 編集方式: "agent"（ReActループ・既定）/ "oneshot"（単発コード生成）
+AGENT_DEFAULT_MODE = os.getenv("XLSX_AGENT_MODE", "agent").lower()
+AGENT_MAX_STEPS = int(os.getenv("XLSX_AGENT_MAX_STEPS", "6"))
+AGENT_STEP_TIMEOUT = int(os.getenv("XLSX_AGENT_STEP_TIMEOUT", "30"))
 SUMMARY_FORMULA_MAX_ROWS = 200
 SUMMARY_FORMULA_MAX_COLS = 50
 PREVIEW_MAX_CHANGED_CELLS = 500
@@ -118,19 +122,8 @@ class LLMClient:
         self._resolved_model = same_base[0] if same_base else self.model
         return self._resolved_model
 
-    def generate_code(
-        self, summary: dict[str, Any], instruction: str, feedback: str = ""
-    ) -> str:
-        prompt = (
-            "あなたはExcel編集用Pythonコード生成器です。"
-            "出力は```python ... ```のコードブロック1つだけにしてください。"
-            "説明文、思考過程、Markdown本文、箇条書きは禁止です。"
-            "使用可能な変数は wb, ws, helpers のみです。"
-            "import / open / exec / eval / ファイルI/O / ネットワーク / OS操作は禁止です。\n"
-            f"sheet_summary={json.dumps(summary, ensure_ascii=False)}\n"
-            f"instruction={instruction}\n"
-            f"feedback={feedback}\n"
-        )
+    def _call_ollama(self, prompt: str) -> str:
+        """Ollama の generate API を叩き、response テキストを返す。"""
         model = self.resolve_model()
         body = {
             "model": model,
@@ -169,11 +162,59 @@ class LLMClient:
             raise JobError(
                 "LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True
             ) from exc
-        text = payload.get("response", "")
+        return payload.get("response", "")
+
+    @staticmethod
+    def _extract_code(text: str) -> str:
         match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
         if match:
             return match.group(1).strip()
         return text.strip()
+
+    def generate_code(
+        self, summary: dict[str, Any], instruction: str, feedback: str = ""
+    ) -> str:
+        prompt = (
+            "あなたはExcel編集用Pythonコード生成器です。"
+            "出力は```python ... ```のコードブロック1つだけにしてください。"
+            "説明文、思考過程、Markdown本文、箇条書きは禁止です。"
+            "使用可能な変数は wb, ws, helpers のみです。"
+            "import / open / exec / eval / ファイルI/O / ネットワーク / OS操作は禁止です。\n"
+            f"sheet_summary={json.dumps(summary, ensure_ascii=False)}\n"
+            f"instruction={instruction}\n"
+            f"feedback={feedback}\n"
+        )
+        return self._extract_code(self._call_ollama(prompt))
+
+    def agent_step(
+        self,
+        summary: dict[str, Any],
+        instruction: str,
+        transcript: list[dict[str, Any]],
+    ) -> str:
+        """ReActエージェントの1ターン分の生応答（コードブロック or DONE）を返す。"""
+        history = ""
+        for item in transcript[-4:]:
+            history += (
+                f"\n# step {item['step']} のコード:\n{item['code']}\n"
+                f"# 実行結果:\n{item['observation']}\n"
+            )
+        prompt = (
+            "あなたはopenpyxlでExcelを編集するエージェントです。"
+            f"変数 wb(Workbook), ws(対象シート '{summary.get('sheet_name', '')}'), "
+            "helpers が使えます。\n"
+            "各ターンの応答は次のどちらか一つだけ:\n"
+            "  1) 次に実行するコードを ```python ... ``` で1ブロック"
+            "（print()で値を確認してよい）\n"
+            "  2) 指示が完了したら DONE の一語のみ\n"
+            "import可能: datetime, re, math, openpyxl.styles 等"
+            "（os / sys / ファイル / ネットワークは不可）。"
+            "説明・思考は書かない。\n"
+            f"指示: {instruction}\n"
+            f"シート要約: {json.dumps(summary, ensure_ascii=False)[:2500]}\n"
+            f"これまでの経過:{history if history else ' （なし。最初のステップ）'}\n"
+        )
+        return self._call_ollama(prompt)
 
 
 class CodeChecker:
@@ -647,10 +688,13 @@ def _create_preview(
 
 
 class JobService:
-    def __init__(self, root_dir: Path, llm: LLMClient | None = None) -> None:
+    def __init__(
+        self, root_dir: Path, llm: LLMClient | None = None, mode: str | None = None
+    ) -> None:
         self.root_dir = root_dir
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.llm = llm or LLMClient()
+        self.mode = (mode or AGENT_DEFAULT_MODE).lower()
         self.checker = CodeChecker()
         self.jobs: dict[str, Job] = {}
         self.download_tokens: dict[str, Path] = {}
@@ -734,6 +778,42 @@ class JobService:
             finally:
                 self.q.task_done()
 
+    def _run_oneshot(
+        self,
+        job: Job,
+        summary: dict[str, Any],
+        blocked_cells: set[str],
+        sheet_name: str,
+        result_path: Path,
+    ) -> None:
+        """単発モード: コードを1回生成→ASTチェック→サンドボックス実行。"""
+        feedback = ""
+        validation_errors: list[str] = []
+        for _ in range(LLM_MAX_RETRY):
+            job.status = JobStatus.GENERATING
+            generated_code = self.llm.generate_code(
+                summary, job.instruction, feedback=feedback
+            )
+            job.status = JobStatus.CHECKING
+            try:
+                self.checker.validate(generated_code, blocked_cells)
+                break
+            except JobError as err:
+                feedback = f"{err.error_code}: {err.message}"
+                validation_errors.append(feedback)
+        else:
+            reason = (
+                "; ".join(validation_errors)
+                if validation_errors
+                else "コード生成に失敗しました（検証詳細なし）"
+            )
+            raise JobError(
+                "CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}"
+            )
+
+        job.status = JobStatus.EXECUTING
+        _exec_in_sandbox(result_path, sheet_name, generated_code)
+
     def _process(self, job_id: str) -> None:
         job = self.get_job(job_id)
         try:
@@ -751,35 +831,25 @@ class JobService:
             blocked_cells = _non_anchor_cells(ws)
             _close_workbook(wb)
 
-            generated_code = ""
-            feedback = ""
-            validation_errors: list[str] = []
-            for _ in range(LLM_MAX_RETRY):
-                job.status = JobStatus.GENERATING
-                generated_code = self.llm.generate_code(
-                    summary, job.instruction, feedback=feedback
-                )
-                job.status = JobStatus.CHECKING
-                try:
-                    self.checker.validate(generated_code, blocked_cells)
-                    break
-                except JobError as err:
-                    feedback = f"{err.error_code}: {err.message}"
-                    validation_errors.append(feedback)
-            else:
-                reason = (
-                    "; ".join(validation_errors)
-                    if validation_errors
-                    else "コード生成に失敗しました（検証詳細なし）"
-                )
-                raise JobError(
-                    "CODE_CHECK_FAILED", f"コード再生成上限に達しました: {reason}"
-                )
-
-            job.status = JobStatus.EXECUTING
             result_path = job.work_dir / f"result{job.source_path.suffix}"
             shutil.copy2(job.source_path, result_path)
-            _exec_in_sandbox(result_path, sheet_name, generated_code)
+
+            if self.mode == "oneshot":
+                self._run_oneshot(job, summary, blocked_cells, sheet_name, result_path)
+            else:
+                from app import agent
+
+                job.status = JobStatus.GENERATING
+                agent.run_agent(
+                    result_path,
+                    sheet_name,
+                    job.instruction,
+                    summary,
+                    self.llm,
+                    max_steps=AGENT_MAX_STEPS,
+                    step_timeout=AGENT_STEP_TIMEOUT,
+                )
+
             job.preview = _create_preview(job.source_path, result_path, sheet_name)
             job.result_path = result_path
             job.status = JobStatus.PREVIEW_READY

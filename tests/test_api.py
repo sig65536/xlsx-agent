@@ -36,7 +36,9 @@ def _download_endpoint(app):
 
 
 def _run_lifecycle(tmp_path: Path, filename: str) -> tuple[JobService, str, bytes, str]:
-    service = JobService(tmp_path / f"jobs-{Path(filename).suffix[1:]}", llm=StubLLM())
+    service = JobService(
+        tmp_path / f"jobs-{Path(filename).suffix[1:]}", llm=StubLLM(), mode="oneshot"
+    )
     job_id = service.create_job(_upload(filename), "A1をeditedに変更", None)
 
     status = "queued"

@@ -1,0 +1,108 @@
+import io
+import time
+from pathlib import Path
+
+import pytest
+from fastapi import UploadFile
+from openpyxl import Workbook, load_workbook
+
+from app.agent import parse_action, precheck_step_code, run_agent
+from app.main import JobError, JobService
+
+
+def _workbook_bytes() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "before"
+    ws["B1"] = 10
+    ws["B2"] = 20
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+class StepLLM:
+    """与えられたコード列を順に返し、最後に DONE を返すスタブ。"""
+
+    def __init__(self, codes: list[str]):
+        self._codes = codes
+        self.calls = 0
+
+    def agent_step(self, summary, instruction, transcript):
+        idx = self.calls
+        self.calls += 1
+        if idx < len(self._codes):
+            return f"```python\n{self._codes[idx]}\n```"
+        return "DONE"
+
+
+def _run_agent_on(tmp_path: Path, codes: list[str]) -> Path:
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    summary = {"sheet_name": "Sheet"}
+    run_agent(src, "Sheet", "テスト", summary, StepLLM(codes), max_steps=6, step_timeout=30)
+    return src
+
+
+def test_parse_action_code_and_done() -> None:
+    kind, code = parse_action("```python\nws['A1']=1\n```")
+    assert kind == "code" and code == "ws['A1']=1"
+    assert parse_action("DONE")[0] == "done"
+    assert parse_action("特に何もありません")[0] == "done"
+
+
+def test_precheck_rejects_escape() -> None:
+    with pytest.raises(JobError):
+        precheck_step_code("x = ws.__class__")
+    with pytest.raises(JobError):
+        precheck_step_code("open('/etc/passwd')")
+
+
+def test_agent_multistep_edit(tmp_path: Path) -> None:
+    out = _run_agent_on(
+        tmp_path,
+        [
+            "ws['A1'] = 'edited'",
+            "ws['B3'] = ws['B1'].value + ws['B2'].value",
+        ],
+    )
+    wb = load_workbook(out)
+    assert wb.active["A1"].value == "edited"
+    assert wb.active["B3"].value == 30
+
+
+def test_agent_allows_whitelisted_import_for_formatting(tmp_path: Path) -> None:
+    """openpyxl.styles の import が通り、書式設定ができること（緩和の要点）。"""
+    out = _run_agent_on(
+        tmp_path,
+        [
+            "from openpyxl.styles import Font\nws['A1'].font = Font(bold=True)",
+        ],
+    )
+    wb = load_workbook(out)
+    assert wb.active["A1"].font.bold is True
+
+
+def test_agent_blocks_dangerous_import(tmp_path: Path) -> None:
+    """os の import はサンドボックスで失敗し、ジョブ全体は失敗扱いになること。"""
+    with pytest.raises(JobError):
+        _run_agent_on(tmp_path, ["import os\nos.listdir('/')"])
+
+
+def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:
+    class AgentStub:
+        def agent_step(self, summary, instruction, transcript):
+            if not transcript:
+                return "```python\nws['A1'] = 'edited'\n```"
+            return "DONE"
+
+    service = JobService(tmp_path / "jobs", llm=AgentStub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="sample.xlsx")
+    job_id = service.create_job(upload, "A1をeditedに", None)
+    for _ in range(60):
+        job = service.get_job(job_id)
+        if job.status in ("preview_ready", "error"):
+            break
+        time.sleep(0.1)
+    assert job.status == "preview_ready", f"{job.error_code}: {job.message}"
+    assert job.preview["changed_cell_count"] >= 1

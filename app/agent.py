@@ -283,6 +283,13 @@ def _disable_network() -> None:
         socket.socket.__init__ = _blocked_init  # type: ignore[method-assign]
     except Exception:
         socket.socket = _blocked  # type: ignore[assignment]  # フォールバック
+    # __init__ を迂回して __new__ 等で生成されても egress できないよう、
+    # 接続/送信メソッド自体も潰す（既存の mp pipe は connect/sendto を使わない）。
+    for _meth in ("connect", "connect_ex", "sendto"):
+        try:
+            setattr(socket.socket, _meth, _blocked)
+        except Exception:
+            pass
     # 高水準API・名前解決を塞ぐ（DNS exfiltration 等の経路も断つ）。
     # getaddrinfo 系だけでなく旧来の resolver(gethostby*) も含める。
     for _name in (

@@ -57,6 +57,13 @@ def _network_probe(conn):
         result["legacy_dns"] = "open"
     except OSError:
         result["legacy_dns"] = "blocked"
+    # __init__ を迂回して __new__ で生成しても connect が塞がれている
+    try:
+        s = socket.socket.__new__(socket.socket)
+        s.connect(("example.com", 80))
+        result["new_connect"] = "open"
+    except Exception:
+        result["new_connect"] = "blocked"
     conn.send(result)
 
 
@@ -324,6 +331,7 @@ def test_disable_network_blocks_sockets() -> None:
     assert result["socket"] == "blocked"
     assert result["dns"] == "blocked"           # DNS(getaddrinfo)も遮断
     assert result["legacy_dns"] == "blocked"     # 旧resolver(gethostbyname)も遮断
+    assert result["new_connect"] == "blocked"    # __new__ 迂回でも connect 不可
     assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 

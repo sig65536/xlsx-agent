@@ -585,32 +585,33 @@ def _create_preview(
         before_path, keep_vba=_keep_vba_for(before_path), data_only=False
     )
     after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
-
-    # 全シートを比較する。エージェントは他シートも編集できるため、対象シートだけ
-    # 差分を取ると「見ていない変更」をユーザーが承認してしまう。
-    before_names = set(before.sheetnames)
-    after_names = set(after.sheetnames)
     changed_cells: list[dict[str, Any]] = []
     notes = [PREVIEW_FORMULA_NOTE]
+    try:
+        # 全シートを比較する。エージェントは他シートも編集できるため、対象シート
+        # だけ差分を取ると「見ていない変更」をユーザーが承認してしまう。
+        before_names = set(before.sheetnames)
+        after_names = set(after.sheetnames)
 
-    # 対象シートを先頭に、それ以外を後ろに並べて差分を取る
-    common = [n for n in after.sheetnames if n in before_names]
-    common.sort(key=lambda n: (n != sheet_name, n))
-    for name in common:
-        changed_cells.extend(_diff_sheet(before[name], after[name], name))
+        # 対象シートを先頭に、それ以外を後ろに並べて差分を取る
+        common = [n for n in after.sheetnames if n in before_names]
+        common.sort(key=lambda n: (n != sheet_name, n))
+        for name in common:
+            changed_cells.extend(_diff_sheet(before[name], after[name], name))
 
-    added = [n for n in after.sheetnames if n not in before_names]
-    removed = [n for n in before.sheetnames if n not in after_names]
-    if added:
-        empty_ws = Workbook().active  # 空シートを基準に新規シートの内容を差分表示
-        for name in added:
-            changed_cells.extend(_diff_sheet(empty_ws, after[name], name))
-            notes.append(f"シート「{name}」が新規追加されました。")
-    for name in removed:
-        notes.append(f"シート「{name}」が削除されました。")
-
-    _close_workbook(before)
-    _close_workbook(after)
+        added = [n for n in after.sheetnames if n not in before_names]
+        removed = [n for n in before.sheetnames if n not in after_names]
+        if added:
+            empty_ws = Workbook().active  # 空シート基準に新規シートの内容を差分表示
+            for name in added:
+                changed_cells.extend(_diff_sheet(empty_ws, after[name], name))
+                notes.append(f"シート「{name}」が新規追加されました。")
+        for name in removed:
+            notes.append(f"シート「{name}」が削除されました。")
+    finally:
+        # 差分中に例外が出ても FD を確実に解放する
+        _close_workbook(before)
+        _close_workbook(after)
     return {
         "sheet_name": sheet_name,
         "sheets_changed": sorted({c["sheet"] for c in changed_cells}),

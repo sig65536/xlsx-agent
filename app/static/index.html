@@ -375,7 +375,8 @@ function renderPreview(jobId, preview) {
   for (const c of shown) {
     const styleTag = c.style_changed ? '<span class="tag">書式変更</span>' : "";
     const tr = document.createElement("tr");
-    const cellLabel = c.sheet ? `${c.sheet}!${c.cell}` : c.cell;
+    const rawLabel = c.sheet ? `${c.sheet}!${c.cell}` : c.cell;
+    const cellLabel = fmtVal(rawLabel);  // シート名はファイル由来なのでHTMLエスケープ必須
     tr.innerHTML = `<td class="cell">${cellLabel}${styleTag}</td>` +
                    `<td class="before">${fmtVal(c.before)}</td>` +
                    `<td class="after">${fmtVal(c.after)}</td>`;

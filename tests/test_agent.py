@@ -147,6 +147,21 @@ def test_agent_rolls_back_failed_step(tmp_path: Path) -> None:
     assert wb.active["B1"].value == "good"
 
 
+def test_agent_preserves_vars_across_rollback(tmp_path: Path) -> None:
+    """失敗ステップのロールバック後も、成功ステップで定義した変数は残る。"""
+    out = _run_agent_on(
+        tmp_path,
+        [
+            "counter = 5",                       # 変数定義（成功）
+            "ws['A1'] = str(counter)\n1 / 0",    # 途中で失敗 → ロールバック
+            "ws['B1'] = str(counter)",           # counter が残っていれば成功
+        ],
+    )
+    wb = load_workbook(out)
+    assert wb.active["A1"].value == "before"  # 失敗ステップは巻き戻る
+    assert wb.active["B1"].value == "5"        # counter は保持されている
+
+
 def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
     """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
 

@@ -271,9 +271,11 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
             workbook.save(buffer)
             return buffer.getvalue()
 
+        reserved_keys = {"__builtins__", "wb", "ws", "helpers"}
         wb = load_workbook(input_path, keep_vba=keep_vba, data_only=False)
         namespace: dict[str, Any] = _build_namespace(wb)
         committed = _snapshot(wb)  # 直近の「成功状態」のスナップショット
+        committed_vars: dict[str, Any] = {}  # 直近成功時のLLM定義変数
         conn.send({"ok": True})
     except Exception:
         try:
@@ -295,6 +297,10 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
                 with redirect_stdout(buf):
                     exec(compile(msg["code"], "<agent-step>", "exec"), namespace)
                 committed = _snapshot(namespace["wb"])  # 成功 → コミット
+                # 成功時のLLM定義変数も控えておく（ロールバック時に復元するため）
+                committed_vars = {
+                    k: v for k, v in namespace.items() if k not in reserved_keys
+                }
                 conn.send({"ok": True, "stdout": buf.getvalue()[-MAX_OBSERVATION_CHARS:]})
             except Exception:
                 error_text = traceback.format_exc()[-MAX_OBSERVATION_CHARS:]
@@ -309,6 +315,8 @@ def _agent_worker(input_path: str, sheet_name: str, conn) -> None:
                         io.BytesIO(committed), keep_vba=keep_vba, data_only=False
                     )
                     namespace = _build_namespace(wb)
+                    # 直近成功時のLLM定義変数を復元（NameError防止）
+                    namespace.update(committed_vars)
                 except Exception:
                     pass
                 conn.send(

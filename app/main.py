@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
+from starlette.concurrency import run_in_threadpool
 
 from app.common import (
     JobError,
@@ -83,6 +84,9 @@ class LLMClient:
         )
         self.model = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+        # thinking(推論)モード。gemma4 等の対応モデルで思考トレースを有効化する。
+        # CPU推論では遅くなるため既定はオフ。Ollamaは thinking を response と分離する。
+        self.think = os.getenv("XLSX_AGENT_THINK", "0").lower() not in ("0", "false", "")
         self._resolved_model: str | None = None
 
     @property
@@ -121,7 +125,7 @@ class LLMClient:
         self._resolved_model = same_base[0] if same_base else self.model
         return self._resolved_model
 
-    def _call_ollama(self, prompt: str) -> str:
+    def _call_ollama(self, prompt: str, think: bool | None = None) -> str:
         """Ollama の generate API を叩き、response テキストを返す。"""
         model = self.resolve_model()
         body = {
@@ -130,6 +134,8 @@ class LLMClient:
             "prompt": prompt,
             "options": {"temperature": 0.1},
         }
+        if self.think if think is None else think:
+            body["think"] = True  # 思考トレースは payload["thinking"] に分離される
         data = json.dumps(body).encode("utf-8")
         req = Request(
             self.endpoint,
@@ -190,6 +196,7 @@ class LLMClient:
         summary: dict[str, Any],
         instruction: str,
         transcript: list[dict[str, Any]],
+        think: bool | None = None,
     ) -> str:
         """ReActエージェントの1ターン分の生応答（コードブロック or DONE）を返す。"""
         history = ""
@@ -213,7 +220,7 @@ class LLMClient:
             f"シート要約: {json.dumps(summary, ensure_ascii=False)}\n"
             f"これまでの経過:{history if history else ' （なし。最初のステップ）'}\n"
         )
-        return self._call_ollama(prompt)
+        return self._call_ollama(prompt, think=think)
 
 
 class CodeChecker:
@@ -817,6 +824,170 @@ class JobService:
                     shutil.rmtree(job.work_dir, ignore_errors=True)
 
 
+CHAT_MAX_HISTORY = 6  # プロンプトに含める直近の依頼数
+CHAT_UNDO_LIMIT = 20  # 保持する版数の上限
+
+
+@dataclass
+class ChatSession:
+    session_id: str
+    work_dir: Path
+    ext: str
+    sheet_name: str | None
+    versions: list[Path]  # versions[0]=元ファイル, 末尾=現在の状態
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    created_at: float = 0.0
+
+
+class SessionService:
+    """チャット形式の編集セッション。1ファイルをアップロード後、複数の指示を
+    現在の状態に積み重ねて適用し、Undo で1手戻せる。"""
+
+    def __init__(
+        self, root_dir: Path, llm: LLMClient | None = None, mode: str | None = None
+    ) -> None:
+        self.root_dir = root_dir
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.llm = llm or LLMClient()
+        self.mode = (mode or AGENT_DEFAULT_MODE).lower()
+        self.sessions: dict[str, ChatSession] = {}
+        self.lock = threading.Lock()
+        self.cleaner = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleaner.start()
+
+    def create_session(self, upload: UploadFile, sheet_name: str | None) -> dict[str, Any]:
+        ext = Path(upload.filename or "").suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            raise JobError("UNSUPPORTED_FORMAT", "対応形式は .xlsx / .xlsm のみです")
+        payload = upload.file.read(MAX_FILE_SIZE_BYTES + 1)
+        if len(payload) > MAX_FILE_SIZE_BYTES:
+            raise JobError("FILE_TOO_LARGE", "ファイルサイズが上限を超えています")
+        try:
+            wb = load_workbook(io.BytesIO(payload), keep_vba=(ext == ".xlsm"), data_only=False)
+            sheets = list(wb.sheetnames)
+            active = (
+                sheet_name if sheet_name and sheet_name in sheets else wb.active.title
+            )
+            _close_workbook(wb)
+        except Exception as exc:
+            raise JobError(
+                "UNSUPPORTED_FORMAT", f"Excelファイルを開けませんでした: {exc}"
+            ) from exc
+
+        session_id = uuid.uuid4().hex
+        work_dir = self.root_dir / session_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        v0 = work_dir / f"v0{ext}"
+        v0.write_bytes(payload)
+        with self.lock:
+            self.sessions[session_id] = ChatSession(
+                session_id=session_id,
+                work_dir=work_dir,
+                ext=ext,
+                sheet_name=active,
+                versions=[v0],
+                created_at=time.time(),
+            )
+        return {"session_id": session_id, "sheets": sheets, "active_sheet": active}
+
+    def _get(self, session_id: str) -> ChatSession:
+        with self.lock:
+            session = self.sessions.get(session_id)
+        if not session:
+            raise KeyError(session_id)
+        return session
+
+    def post_message(
+        self, session_id: str, instruction: str, think: bool | None = None
+    ) -> dict[str, Any]:
+        session = self._get(session_id)
+        if not instruction.strip():
+            raise JobError("INVALID_STATE", "指示が空です")
+        current = session.versions[-1]
+
+        wb = load_workbook(current, keep_vba=_keep_vba_for(current), data_only=False)
+        ws = (
+            wb[session.sheet_name]
+            if session.sheet_name and session.sheet_name in wb.sheetnames
+            else wb.active
+        )
+        sheet_name = ws.title
+        summary = _summarize_sheet(ws)
+        _close_workbook(wb)
+
+        candidate = session.work_dir / f"v{len(session.versions)}{session.ext}"
+        shutil.copy2(current, candidate)
+        try:
+            if self.mode == "oneshot":
+                raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
+            from app import agent
+
+            agent.run_agent(
+                candidate,
+                sheet_name,
+                self._augment(session, instruction),
+                summary,
+                self.llm,
+                max_steps=AGENT_MAX_STEPS,
+                step_timeout=AGENT_STEP_TIMEOUT,
+                think=think,
+            )
+        except Exception:
+            candidate.unlink(missing_ok=True)
+            raise
+
+        preview = _create_preview(current, candidate, sheet_name)
+        with self.lock:
+            session.versions.append(candidate)
+            # Undo 上限を超えた古い版は削除（先頭の元ファイルは残す）
+            while len(session.versions) > CHAT_UNDO_LIMIT + 1:
+                old = session.versions.pop(1)
+                old.unlink(missing_ok=True)
+            session.messages.append({"role": "user", "text": instruction})
+            session.messages.append(
+                {"role": "assistant", "preview": preview}
+            )
+        return {"preview": preview, "can_undo": len(session.versions) > 1}
+
+    def undo(self, session_id: str) -> dict[str, Any]:
+        session = self._get(session_id)
+        with self.lock:
+            if len(session.versions) <= 1:
+                raise JobError("INVALID_STATE", "これ以上戻せません")
+            removed = session.versions.pop()
+            removed.unlink(missing_ok=True)
+            session.messages.append({"role": "system", "text": "1手戻しました"})
+        return {"ok": True, "can_undo": len(session.versions) > 1}
+
+    def current_path(self, session_id: str) -> Path:
+        session = self._get(session_id)
+        return session.versions[-1]
+
+    def _augment(self, session: ChatSession, instruction: str) -> str:
+        """直近の依頼履歴を文脈として今回の指示に付与する（代名詞解決のため）。"""
+        prior = [m["text"] for m in session.messages if m.get("role") == "user"]
+        prior = prior[-CHAT_MAX_HISTORY:]
+        if not prior:
+            return instruction
+        history = "\n".join(f"- {text}" for text in prior)
+        return f"これまでの依頼:\n{history}\n\n今回の依頼: {instruction}"
+
+    def _cleanup_loop(self) -> None:
+        while True:
+            time.sleep(60)
+            now = time.time()
+            with self.lock:
+                expired = [
+                    sid
+                    for sid, s in self.sessions.items()
+                    if now - s.created_at > JOB_TTL_SECONDS
+                ]
+                for sid in expired:
+                    session = self.sessions.pop(sid, None)
+                    if session and session.work_dir.exists():
+                        shutil.rmtree(session.work_dir, ignore_errors=True)
+
+
 def _to_job_response(job: Job) -> dict[str, Any]:
     data = {
         "job_id": job.job_id,
@@ -838,6 +1009,9 @@ def _to_job_response(job: Job) -> dict[str, Any]:
 def create_app(job_service: JobService | None = None) -> FastAPI:
     app = FastAPI(title="xlsx-agent", version="0.1")
     service = job_service or JobService(Path(os.getenv("JOB_ROOT", "./data/jobs")))
+    chat = SessionService(
+        Path(os.getenv("SESSION_ROOT", "./data/sessions")), llm=service.llm
+    )
 
     # ブラウザ（別PC）からのアクセスを許可する。
     # 既定は全許可。特定のオリジンに限定したい場合は CORS_ORIGINS にカンマ区切りで指定。
@@ -855,12 +1029,73 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
     )
 
     @app.get("/healthz", include_in_schema=False)
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok", "model": service.llm.model}
+    async def healthz() -> dict[str, Any]:
+        return {"status": "ok", "model": service.llm.model, "think": service.llm.think}
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "chat.html")
+
+    @app.get("/classic", include_in_schema=False)
+    async def classic() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    # ---- チャット（セッション）API ----
+    def _chat_error(err: JobError) -> HTTPException:
+        return HTTPException(
+            status_code=400,
+            detail={
+                "error_code": err.error_code,
+                "message": err.message,
+                "retryable": err.retryable,
+            },
+        )
+
+    @app.post("/sessions")
+    async def create_session(
+        file: UploadFile = File(...),
+        sheet_name: str | None = Form(default=None),
+    ) -> dict[str, Any]:
+        try:
+            return chat.create_session(file, sheet_name)
+        except JobError as err:
+            raise _chat_error(err) from err
+
+    @app.post("/sessions/{session_id}/messages")
+    async def post_message(
+        session_id: str,
+        instruction: str = Form(...),
+        think: bool = Form(default=False),
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                chat.post_message, session_id, instruction, think
+            )
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail="session not found") from err
+        except JobError as err:
+            raise _chat_error(err) from err
+
+    @app.post("/sessions/{session_id}/undo")
+    async def undo_session(session_id: str) -> dict[str, Any]:
+        try:
+            return chat.undo(session_id)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail="session not found") from err
+        except JobError as err:
+            raise _chat_error(err) from err
+
+    @app.get("/sessions/{session_id}/download")
+    async def download_session(session_id: str):
+        try:
+            path = chat.current_path(session_id)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail="session not found") from err
+        return FileResponse(
+            path,
+            filename=f"edited{path.suffix}",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     @app.post("/jobs")
     async def create_job(

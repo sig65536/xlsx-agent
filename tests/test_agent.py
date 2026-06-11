@@ -85,7 +85,7 @@ class StepLLM:
         self._codes = codes
         self.calls = 0
 
-    def agent_step(self, summary, instruction, transcript):
+    def agent_step(self, summary, instruction, transcript, think=None):
         idx = self.calls
         self.calls += 1
         if idx < len(self._codes):
@@ -221,7 +221,7 @@ def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
     """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
 
     class NeverDoneLLM:
-        def agent_step(self, summary, instruction, transcript):
+        def agent_step(self, summary, instruction, transcript, think=None):
             return "```python\nws['A1'] = 'x'\n```"
 
     src = tmp_path / "input.xlsx"
@@ -335,9 +335,38 @@ def test_disable_network_blocks_sockets() -> None:
     assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 
+def test_chat_session_flow_and_undo(tmp_path: Path) -> None:
+    from app.main import SessionService
+
+    class ChatStub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            if not transcript:
+                return "```python\nws['A1'] = 'hi'\n```"
+            return "DONE"
+
+    svc = SessionService(tmp_path / "sessions", llm=ChatStub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    info = svc.create_session(upload, None)
+    sid = info["session_id"]
+    assert "Sheet" in info["sheets"]
+
+    res = svc.post_message(sid, "A1をhiに変更")
+    assert res["preview"]["changed_cell_count"] >= 1
+    assert res["can_undo"] is True
+    wb = load_workbook(svc.current_path(sid))
+    assert wb.active["A1"].value == "hi"
+    wb.close()
+
+    # Undo で元に戻る
+    svc.undo(sid)
+    wb2 = load_workbook(svc.current_path(sid))
+    assert wb2.active["A1"].value == "before"
+    wb2.close()
+
+
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:
     class AgentStub:
-        def agent_step(self, summary, instruction, transcript):
+        def agent_step(self, summary, instruction, transcript, think=None):
             if not transcript:
                 return "```python\nws['A1'] = 'edited'\n```"
             return "DONE"

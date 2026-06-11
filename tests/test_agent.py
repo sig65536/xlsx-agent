@@ -1,4 +1,7 @@
 import io
+import multiprocessing as mp
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -13,6 +16,22 @@ from app.agent import (
     run_agent,
 )
 from app.main import JobError, JobService
+
+
+def _hardening_probe(conn):
+    """spawn子プロセスで hardening を適用し、結果を親へ返す（テスト用）。"""
+    import resource
+
+    from app.agent import _harden_worker_process
+
+    _harden_worker_process()
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    conn.send(
+        {
+            "nofile": soft,
+            "config_scrubbed": "XLSX_AGENT_WORKER_NOFILE" not in os.environ,
+        }
+    )
 
 
 def _workbook_bytes() -> bytes:
@@ -246,6 +265,25 @@ def test_scrub_env_keeps_system_drops_secrets() -> None:
     assert "GITHUB_TOKEN" not in env
     assert "MY_API_KEY" not in env
     assert "OLLAMA_ENDPOINT" not in env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="resource limits are POSIX-only")
+def test_worker_reads_config_before_env_scrub() -> None:
+    """XLSX_AGENT_WORKER_* はスクラブより先に読まれる（順序バグの回帰テスト）。"""
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    os.environ["XLSX_AGENT_WORKER_NOFILE"] = "128"
+    os.environ["XLSX_AGENT_DISABLE_NETWORK"] = "0"
+    try:
+        proc = ctx.Process(target=_hardening_probe, args=(child,))
+        proc.start()
+        result = parent.recv()
+        proc.join(10)
+    finally:
+        os.environ.pop("XLSX_AGENT_WORKER_NOFILE", None)
+        os.environ.pop("XLSX_AGENT_DISABLE_NETWORK", None)
+    assert result["nofile"] == 128  # スクラブ前に設定を読めている
+    assert result["config_scrubbed"] is True  # その後 env はスクラブされている
 
 
 def test_disable_network_blocks_sockets() -> None:

@@ -338,16 +338,19 @@ def _harden_worker_process() -> None:
             _disable_network()
         except Exception:
             pass
-    try:
-        _scrub_env(os.environ)
-    except Exception:
-        pass
+    # リソース上限・権限ドロップは XLSX_AGENT_WORKER_* を参照するので、
+    # 環境変数スクラブより「先に」実行する（先にスクラブすると設定が消える）。
     try:
         _apply_resource_limits()
     except Exception:
         pass
     try:
         _drop_privileges()
+    except Exception:
+        pass
+    # 設定値を読み終えた後に env をスクラブ（XLSX_AGENT_* 自体も worker から消す）
+    try:
+        _scrub_env(os.environ)
     except Exception:
         pass
 

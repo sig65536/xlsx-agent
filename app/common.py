@@ -5,7 +5,7 @@
 安全に使えるよう、FastAPI/JobService に依存しない部品だけをここに切り出す。
 """
 
-import re
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -40,13 +40,21 @@ def _keep_vba_for(path) -> bool:
 
 
 def _workbook_content_type(path: Path) -> str:
-    """[Content_Types].xml から /xl/workbook.xml のContentTypeを取り出す。"""
+    """[Content_Types].xml から /xl/workbook.xml のContentTypeを取り出す。
+
+    属性の順序や空白に依存しないよう、正規表現ではなくXMLとしてパースする。
+    """
     with zipfile.ZipFile(path) as zf:
-        content_types = zf.read("[Content_Types].xml").decode("utf-8", "ignore")
-    match = re.search(
-        r'PartName="/xl/workbook\.xml"[^>]*ContentType="([^"]+)"', content_types
-    )
-    return match.group(1) if match else ""
+        content_types_xml = zf.read("[Content_Types].xml")
+    try:
+        root = ET.fromstring(content_types_xml)
+    except ET.ParseError:
+        return ""
+    for override in root.iter():
+        if override.tag.endswith("}Override") or override.tag == "Override":
+            if override.get("PartName") == "/xl/workbook.xml":
+                return override.get("ContentType", "")
+    return ""
 
 
 def validate_excel_file(path: Path) -> None:
@@ -109,6 +117,7 @@ def validate_excel_file(path: Path) -> None:
 
 
 def _safe_set_merged_value(ws, merged_range: str, value: Any) -> None:
+    merged_range = merged_range.upper()  # LLMが小文字で渡しても動くよう正規化
     ws.unmerge_cells(merged_range)
     anchor = merged_range.split(":", 1)[0]
     ws[anchor] = value

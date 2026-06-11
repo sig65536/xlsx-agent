@@ -21,7 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from app.common import (
     JobError,
@@ -550,26 +550,19 @@ def _exec_in_sandbox(
         )
 
 
-def _create_preview(
-    before_path: Path, after_path: Path, sheet_name: str
-) -> dict[str, Any]:
-    before = load_workbook(
-        before_path, keep_vba=_keep_vba_for(before_path), data_only=False
-    )
-    after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
-    ws_before = before[sheet_name]
-    ws_after = after[sheet_name]
+def _diff_sheet(ws_before, ws_after, sheet_name: str) -> list[dict[str, Any]]:
     max_row = max(ws_before.max_row, ws_after.max_row)
     max_col = max(ws_before.max_column, ws_after.max_column)
-    changed_cells = []
+    changes = []
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             c1 = ws_before.cell(row=row, column=col)
             c2 = ws_after.cell(row=row, column=col)
             if c1.value != c2.value or c1.style_id != c2.style_id:
                 coord = f"{CodeChecker._col_letters(col)}{row}"
-                changed_cells.append(
+                changes.append(
                     {
+                        "sheet": sheet_name,
                         "cell": coord,
                         "before": c1.value,
                         "after": c2.value,
@@ -582,13 +575,48 @@ def _create_preview(
                         "style_changed": c1.style_id != c2.style_id,
                     }
                 )
+    return changes
+
+
+def _create_preview(
+    before_path: Path, after_path: Path, sheet_name: str
+) -> dict[str, Any]:
+    before = load_workbook(
+        before_path, keep_vba=_keep_vba_for(before_path), data_only=False
+    )
+    after = load_workbook(after_path, keep_vba=_keep_vba_for(after_path), data_only=False)
+
+    # 全シートを比較する。エージェントは他シートも編集できるため、対象シートだけ
+    # 差分を取ると「見ていない変更」をユーザーが承認してしまう。
+    before_names = set(before.sheetnames)
+    after_names = set(after.sheetnames)
+    changed_cells: list[dict[str, Any]] = []
+    notes = [PREVIEW_FORMULA_NOTE]
+
+    # 対象シートを先頭に、それ以外を後ろに並べて差分を取る
+    common = [n for n in after.sheetnames if n in before_names]
+    common.sort(key=lambda n: (n != sheet_name, n))
+    for name in common:
+        changed_cells.extend(_diff_sheet(before[name], after[name], name))
+
+    added = [n for n in after.sheetnames if n not in before_names]
+    removed = [n for n in before.sheetnames if n not in after_names]
+    if added:
+        empty_ws = Workbook().active  # 空シートを基準に新規シートの内容を差分表示
+        for name in added:
+            changed_cells.extend(_diff_sheet(empty_ws, after[name], name))
+            notes.append(f"シート「{name}」が新規追加されました。")
+    for name in removed:
+        notes.append(f"シート「{name}」が削除されました。")
+
     _close_workbook(before)
     _close_workbook(after)
     return {
         "sheet_name": sheet_name,
+        "sheets_changed": sorted({c["sheet"] for c in changed_cells}),
         "changed_cell_count": len(changed_cells),
         "changed_cells": changed_cells[:PREVIEW_MAX_CHANGED_CELLS],
-        "notes": [PREVIEW_FORMULA_NOTE],
+        "notes": notes,
     }
 
 

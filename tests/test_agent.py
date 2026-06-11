@@ -194,6 +194,24 @@ def test_agent_blocks_dangerous_import(tmp_path: Path) -> None:
         _run_agent_on(tmp_path, ["import os\nos.listdir('/')"])
 
 
+def test_preview_detects_cross_sheet_edits(tmp_path: Path) -> None:
+    """他シートへの編集もプレビューに出る（見ていない変更を承認させない）。"""
+    from app.main import _create_preview
+
+    wb = Workbook()
+    wb.active["A1"] = "x"
+    wb.create_sheet("Other")["A1"] = "old"
+    before = tmp_path / "b.xlsx"
+    wb.save(before)
+    wb["Other"]["A1"] = "new"  # アクティブでないシートを編集
+    after = tmp_path / "a.xlsx"
+    wb.save(after)
+
+    preview = _create_preview(before, after, wb.active.title)
+    assert preview["changed_cell_count"] >= 1
+    assert "Other" in preview["sheets_changed"]
+
+
 def test_jobservice_agent_mode_lifecycle(tmp_path: Path) -> None:
     class AgentStub:
         def agent_step(self, summary, instruction, transcript):

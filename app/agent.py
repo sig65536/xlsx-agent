@@ -36,7 +36,6 @@ _SAFE_IMPORT_ROOTS = {
     "functools",
     "json",
     "copy",
-    "random",
     "textwrap",
     "unicodedata",
 }

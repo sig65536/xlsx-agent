@@ -357,7 +357,8 @@ function renderPreview(jobId, preview) {
   $("progressCard").classList.add("hidden");
   $("previewCard").classList.remove("hidden");
   $("changeCount").textContent = preview.changed_cell_count;
-  $("sheetLbl").textContent = preview.sheet_name || "—";
+  const sheetsChanged = preview.sheets_changed || [];
+  $("sheetLbl").textContent = sheetsChanged.length ? sheetsChanged.join(", ") : (preview.sheet_name || "—");
 
   const shown = preview.changed_cells || [];
   const truncated = preview.changed_cell_count > shown.length;
@@ -374,7 +375,8 @@ function renderPreview(jobId, preview) {
   for (const c of shown) {
     const styleTag = c.style_changed ? '<span class="tag">書式変更</span>' : "";
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td class="cell">${c.cell}${styleTag}</td>` +
+    const cellLabel = c.sheet ? `${c.sheet}!${c.cell}` : c.cell;
+    tr.innerHTML = `<td class="cell">${cellLabel}${styleTag}</td>` +
                    `<td class="before">${fmtVal(c.before)}</td>` +
                    `<td class="after">${fmtVal(c.after)}</td>`;
     body.appendChild(tr);

@@ -80,9 +80,11 @@ def test_precheck_rejects_escape() -> None:
         precheck_step_code("import os as x\nx.listdir('/')")
     with pytest.raises(JobError):
         precheck_step_code("from datetime import __class__ as c")
-    # 文字列フォーマット経由の属性チェーン脱獄を遮断
+    # 文字列フォーマット経由の属性チェーン脱獄を遮断（ダンダー/単一アンダースコア両方）
     with pytest.raises(JobError):
         precheck_step_code("ws['A1'] = '{0.__class__.__init__}'.format(ws)")
+    with pytest.raises(JobError):
+        precheck_step_code("ws['A1'] = '{0._os.environ}'.format(random)")
 
 
 def test_safe_import_blocks_dangerous_fromlist_alias() -> None:
@@ -93,8 +95,12 @@ def test_safe_import_blocks_dangerous_fromlist_alias() -> None:
         _safe_import("random", fromlist=("_os",))
     with pytest.raises(ImportError):
         _safe_import("datetime", fromlist=("os",))
-    # 正当な書式系 import は通る
+    # 正当な書式系 import（from-import）は通る
     assert _safe_import("openpyxl.styles", fromlist=("Font",)) is not None
+    # plain `import openpyxl.utils` は親 openpyxl(load_workbook) を束縛するため拒否
+    with pytest.raises(ImportError):
+        _safe_import("openpyxl.utils", fromlist=())
+    assert _safe_import("openpyxl.utils", fromlist=("get_column_letter",)) is not None
 
 
 def test_precheck_allows_re_compile() -> None:

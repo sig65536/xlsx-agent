@@ -1,0 +1,19 @@
+# Gemini Code Assist (GitHub) の挙動設定
+# https://docs.cloud.google.com/gemini/docs/code-review/customize-repo-review
+have_fun: false
+code_review:
+  disable: false
+  # コメントを出す最小の重大度: LOW / MEDIUM / HIGH / CRITICAL
+  comment_severity_threshold: MEDIUM
+  # コメント上限（-1 で無制限）
+  max_review_comments: -1
+  pull_request_opened:
+    # PRオープン時にサマリを投稿
+    summary: true
+    # PRオープン時にコードレビューを実施
+    code_review: true
+    help: false
+    # ドラフトPRはレビューしない
+    include_drafts: false
+ignore_patterns:
+  - "data/**"

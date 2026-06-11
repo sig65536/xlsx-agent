@@ -52,6 +52,11 @@ def _network_probe(conn):
         result["dns"] = "open"
     except OSError:
         result["dns"] = "blocked"
+    try:
+        socket.gethostbyname("example.com")
+        result["legacy_dns"] = "open"
+    except OSError:
+        result["legacy_dns"] = "blocked"
     conn.send(result)
 
 
@@ -318,6 +323,7 @@ def test_disable_network_blocks_sockets() -> None:
     proc.join(10)
     assert result["socket"] == "blocked"
     assert result["dns"] == "blocked"           # DNS(getaddrinfo)も遮断
+    assert result["legacy_dns"] == "blocked"     # 旧resolver(gethostbyname)も遮断
     assert result["is_class"] is True            # isinstance 互換が壊れていない
 
 

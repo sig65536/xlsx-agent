@@ -283,8 +283,18 @@ def _disable_network() -> None:
         socket.socket.__init__ = _blocked_init  # type: ignore[method-assign]
     except Exception:
         socket.socket = _blocked  # type: ignore[assignment]  # フォールバック
-    # 高水準API・名前解決を塞ぐ（DNS exfiltration 等の経路も断つ）
-    for _name in ("create_connection", "create_server", "getaddrinfo", "getnameinfo"):
+    # 高水準API・名前解決を塞ぐ（DNS exfiltration 等の経路も断つ）。
+    # getaddrinfo 系だけでなく旧来の resolver(gethostby*) も含める。
+    for _name in (
+        "create_connection",
+        "create_server",
+        "getaddrinfo",
+        "getnameinfo",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "gethostbyaddr",
+        "getfqdn",
+    ):
         if hasattr(socket, _name):
             try:
                 setattr(socket, _name, _blocked)

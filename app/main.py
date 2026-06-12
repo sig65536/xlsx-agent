@@ -17,7 +17,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -122,11 +122,24 @@ class LLMClient:
         base = self.endpoint.rsplit("/api/", 1)[0]
         return f"{base}/api/tags"
 
-    def _list_models(self) -> list[str]:
+    def _list_models(self, timeout: int | None = None) -> list[str]:
         req = Request(self._tags_endpoint, method="GET")
-        with urlopen(req, timeout=self.timeout) as resp:
+        with urlopen(req, timeout=timeout or self.timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         return [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+
+    def diagnose(self) -> dict[str, Any]:
+        """Ollama 疎通とモデルの存在を素早く確認する（/healthz 用）。"""
+        info: dict[str, Any] = {"model": self.model, "think": self.think}
+        try:
+            installed = self._list_models(timeout=5)
+            info["ollama"] = "ok"
+            info["installed_models"] = installed
+            info["resolved_model"] = self.resolve_model()
+            info["model_found"] = info["resolved_model"] in installed
+        except Exception as exc:
+            info["ollama"] = f"unreachable: {exc}"
+        return info
 
     def resolve_model(self) -> str:
         """設定モデル名を、実際にOllamaへ入っているタグ名に解決する。
@@ -1072,7 +1085,9 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, Any]:
-        return {"status": "ok", "model": service.llm.model, "think": service.llm.think}
+        # Ollama 疎通とモデルの存在も返す（メッセージ送信の400切り分けに使える）
+        diag = await run_in_threadpool(service.llm.diagnose)
+        return {"status": "ok", **diag}
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -1081,6 +1096,11 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
     @app.get("/classic", include_in_schema=False)
     async def classic() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        # ブラウザが自動取得する favicon。アイコンは無いので 204 で静かに返す。
+        return Response(status_code=204)
 
     # ---- チャット（セッション）API ----
     def _chat_error(err: JobError) -> HTTPException:

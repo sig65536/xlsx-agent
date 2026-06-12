@@ -97,6 +97,23 @@ def test_xlsm_job_lifecycle_preserves_result_and_download_extensions(
     assert 'filename="edited.xlsm"' in content_disposition
 
 
+def test_favicon_and_healthz(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import JobService, create_app
+
+    service = JobService(tmp_path / "jobs", llm=StubLLM())
+    client = TestClient(create_app(service))
+    assert client.get("/favicon.ico").status_code == 204
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    body = health.json()
+    assert body["status"] == "ok"
+    assert "model" in body
+    # Ollama 未起動でも healthz 自体は 200（ollama フィールドで疎通可否を返す）
+    assert "ollama" in body
+
+
 def test_config_env_loader(tmp_path: Path) -> None:
     from app.main import _load_config_env
 

@@ -133,6 +133,36 @@ def test_agent_code_done_finishes_in_one_call(tmp_path: Path) -> None:
     assert load_workbook(src).active["A1"].value == "done"
 
 
+def test_agent_writes_session_log(tmp_path: Path) -> None:
+    """log_path を渡すと、各手の生LLM応答・実行結果・終了状況が記録されること。"""
+
+    class ErrThenDone:
+        model = "stub:latest"
+
+        def __init__(self):
+            self.calls = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.calls += 1
+            if self.calls == 1:
+                return "```python\nws['A1'] = 1/0\n```"  # わざと実行エラー
+            return "```python\nws['A1'] = 'ok'\n```\nDONE"
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    log = tmp_path / "agent.log"
+    run_agent(
+        src, "Sheet", "A1をokに", {"sheet_name": "Sheet"}, ErrThenDone(),
+        max_steps=6, log_path=log,
+    )
+    text = log.read_text(encoding="utf-8")
+    assert "指示: 'A1をokに'" in text
+    assert "model=stub:latest" in text
+    assert "--- 手1" in text and "--- 手2" in text
+    assert "ZeroDivisionError" in text  # 1手目のエラーが残る
+    assert "[終了] 成功" in text
+
+
 def test_precheck_rejects_escape() -> None:
     with pytest.raises(JobError):
         precheck_step_code("x = ws.__class__")

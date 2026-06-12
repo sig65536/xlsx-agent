@@ -70,6 +70,8 @@ LLM_MAX_RETRY = 3
 AGENT_DEFAULT_MODE = os.getenv("XLSX_AGENT_MODE", "agent").lower()
 AGENT_MAX_STEPS = int(os.getenv("XLSX_AGENT_MAX_STEPS", "6"))
 AGENT_STEP_TIMEOUT = int(os.getenv("XLSX_AGENT_STEP_TIMEOUT", "30"))
+# 各手の生LLM応答・実行結果を作業フォルダの agent.log に残す（既定ON。0で無効）
+AGENT_LOG = os.getenv("XLSX_AGENT_LOG", "1") not in ("0", "false", "False", "")
 SUMMARY_FORMULA_MAX_ROWS = 200
 SUMMARY_FORMULA_MAX_COLS = 50
 PREVIEW_MAX_CHANGED_CELLS = 500
@@ -859,6 +861,7 @@ class JobService:
                     self.llm,
                     max_steps=AGENT_MAX_STEPS,
                     step_timeout=AGENT_STEP_TIMEOUT,
+                    log_path=(job.work_dir / "agent.log") if AGENT_LOG else None,
                 )
 
             job.preview = _create_preview(job.source_path, result_path, sheet_name)
@@ -1017,6 +1020,7 @@ class SessionService:
                     step_timeout=AGENT_STEP_TIMEOUT,
                     think=think,
                     progress=progress,
+                    log_path=(session.work_dir / "agent.log") if AGENT_LOG else None,
                 )
             except Exception:
                 candidate.unlink(missing_ok=True)

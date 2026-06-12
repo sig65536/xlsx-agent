@@ -672,10 +672,10 @@ def parse_action(text: str) -> tuple[str, str]:
         code, done_in_code = _strip_done_lines(code)
         if code:
             return ("code_done", code) if (has_done or done_in_code) else ("code", code)
-    if has_done:
-        return "done", ""
     # 3) フェンスが全く無くても、openpyxl 操作らしき記述があれば実行を試みる
     #    （散文・思考は除外しつつ、ベタ書きコードを malformed で捨てない）。
+    #    "コード\nDONE" のようにベタ書きコードと DONE が同居しても取りこぼさないよう、
+    #    この判定は下の `has_done` 早期returnより前に行う。
     if re.search(
         r"(?m)^\s*(?:from\s+openpyxl|import\s+\w|ws\s*[\[.=]|wb\s*[\[.=]|"
         r"for\s+\w+\s+in\b|helpers\b)",
@@ -683,7 +683,9 @@ def parse_action(text: str) -> tuple[str, str]:
     ):
         body, done_in_code = _strip_done_lines(text.strip())
         if body:
-            return ("code_done", body) if done_in_code else ("code", body)
+            return ("code_done", body) if (has_done or done_in_code) else ("code", body)
+    if has_done:
+        return "done", ""
     # コードも明示的な DONE も無い → 不正応答。完了扱いにせず再試行させる。
     return "malformed", ""
 
@@ -817,23 +819,29 @@ def run_agent(
                 _log("[結果] コード＋DONEで実行成功 → 完了")
                 break
 
-        # DONE に到達せずステップ上限で打ち切った場合は、未完成の部分編集を
-        # そのまま保存せず、再試行可能なエラーにする。
-        if not completed:
-            _log(f"[終了] 失敗: ステップ上限({max_steps})に到達。編集は破棄。 steps={len(transcript)} applied={applied}")
+        # 1件も編集できていない場合だけ、再試行可能なエラーにする。
+        #   ・completed（DONE宣言）なのに applied==0 → 中身のない完了 → NO_CHANGES
+        #   ・未完了かつ applied==0 → ステップ上限・何も成果なし → STEP_LIMIT
+        if applied == 0:
+            if completed:
+                _log("[終了] 失敗: 有効な編集なし（AGENT_NO_CHANGES）")
+                raise JobError(
+                    "AGENT_NO_CHANGES",
+                    "エージェントが有効な編集を生成できませんでした",
+                    retryable=True,
+                )
+            _log(f"[終了] 失敗: ステップ上限({max_steps})到達・編集なし")
             raise JobError(
                 "AGENT_STEP_LIMIT",
                 f"ステップ上限({max_steps})に達しました。指示を分割するか "
                 "XLSX_AGENT_MAX_STEPS を増やして再実行してください。",
                 retryable=True,
             )
-        if applied == 0:
-            _log("[終了] 失敗: 有効な編集なし（AGENT_NO_CHANGES）")
-            raise JobError(
-                "AGENT_NO_CHANGES",
-                "エージェントが有効な編集を生成できませんでした",
-                retryable=True,
-            )
+        # ここに来るのは「編集が1件以上ある」場合。たとえ DONE 未宣言（未完了）でも、
+        # 弱いモデルは完了を明示できないだけのことが多く、得られた成果を破棄するより
+        # 保存する方がユーザーに有益。未完了の可能性は completed フラグで呼び出し側へ伝える。
+        if not completed:
+            _log(f"[終了] 未完了だが適用済み編集を保存 (applied={applied})")
         save_result = sandbox.save(str(working_path), timeout=step_timeout)
         if not save_result.get("ok"):
             _log(f"[終了] 失敗: 保存エラー {save_result.get('error', '')}")
@@ -841,7 +849,15 @@ def run_agent(
                 save_result.get("error_code", "EXCEL_SAVE_VALIDATION_FAILED"),
                 f"保存に失敗しました: {save_result.get('error', '')}",
             )
-        _log(f"[終了] 成功: steps={len(transcript)} applied={applied}")
+        _log(
+            f"[終了] {'成功' if completed else '部分保存(未完了)'}: "
+            f"steps={len(transcript)} applied={applied}"
+        )
     finally:
         sandbox.close()
-    return {"steps": len(transcript), "applied": applied, "transcript": transcript}
+    return {
+        "steps": len(transcript),
+        "applied": applied,
+        "transcript": transcript,
+        "completed": completed,
+    }

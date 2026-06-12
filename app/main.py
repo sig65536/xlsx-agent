@@ -909,6 +909,8 @@ class ChatSession:
     created_at: float = 0.0
     # 版ファイル名の一意採番（list長だとUndo上限トリム後に番号が衝突する）
     version_counter: int = 0
+    # メッセージ処理の進捗（message_id -> {phase,status,preview/error...}）
+    progress: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 同一セッションへの同時操作（メッセージ送信/Undo）を直列化する
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -971,19 +973,24 @@ class SessionService:
             raise KeyError(session_id)
         return session
 
-    def post_message(
-        self, session_id: str, instruction: str, think: bool | None = None
+    def _run_message(
+        self, session: ChatSession, instruction: str, think, progress
     ) -> dict[str, Any]:
-        if not instruction.strip():
-            raise JobError("INVALID_STATE", "指示が空です")
-        if self.mode == "oneshot":
-            raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
-        session = self._get(session_id)
+        """メッセージ1件を処理する中核。progress(label) で進捗を通知できる。"""
+
+        def say(label: str) -> None:
+            if progress:
+                try:
+                    progress(label)
+                except Exception:
+                    pass
+
         # 同一セッションへの同時操作を直列化（version番号衝突や履歴破損を防ぐ）
         with session.lock:
             session.created_at = time.time()  # 利用中はTTLを延長
             current = session.versions[-1]
 
+            say("シートを確認中…")
             wb = load_workbook(current, keep_vba=_keep_vba_for(current), data_only=False)
             ws = (
                 wb[session.sheet_name]
@@ -1009,11 +1016,13 @@ class SessionService:
                     max_steps=AGENT_MAX_STEPS,
                     step_timeout=AGENT_STEP_TIMEOUT,
                     think=think,
+                    progress=progress,
                 )
             except Exception:
                 candidate.unlink(missing_ok=True)
                 raise
 
+            say("差分を作成中…")
             preview = _create_preview(current, candidate, sheet_name)
             session.versions.append(candidate)
             # Undo 上限を超えた古い版は削除（先頭の元ファイルは残す）
@@ -1024,6 +1033,75 @@ class SessionService:
             session.messages.append({"role": "assistant", "preview": preview})
             can_undo = len(session.versions) > 1
         return {"preview": preview, "can_undo": can_undo}
+
+    def post_message(
+        self, session_id: str, instruction: str, think: bool | None = None
+    ) -> dict[str, Any]:
+        """同期版（処理完了まで待って結果を返す）。テスト/単純用途向け。"""
+        if not instruction.strip():
+            raise JobError("INVALID_STATE", "指示が空です")
+        if self.mode == "oneshot":
+            raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
+        return self._run_message(self._get(session_id), instruction, think, None)
+
+    def start_message(
+        self, session_id: str, instruction: str, think: bool | None = None
+    ) -> dict[str, Any]:
+        """非同期版。処理をスレッドで開始し message_id を返す。進捗は message_status で。"""
+        if not instruction.strip():
+            raise JobError("INVALID_STATE", "指示が空です")
+        if self.mode == "oneshot":
+            raise JobError("INVALID_STATE", "チャットは agent モードのみ対応です")
+        session = self._get(session_id)
+        message_id = uuid.uuid4().hex
+        session.progress[message_id] = {
+            "message_id": message_id,
+            "status": "processing",
+            "phase": "指示を確認中…",
+        }
+        # 古い進捗エントリを間引く（メモリ肥大防止）
+        if len(session.progress) > 10:
+            for old_id in list(session.progress)[:-10]:
+                session.progress.pop(old_id, None)
+
+        def _set_phase(label: str) -> None:
+            entry = session.progress.get(message_id)
+            if entry is not None:
+                entry["phase"] = label
+
+        def _runner() -> None:
+            try:
+                result = self._run_message(session, instruction, think, _set_phase)
+                session.progress[message_id] = {
+                    "message_id": message_id,
+                    "status": "done",
+                    **result,
+                }
+            except JobError as err:
+                session.progress[message_id] = {
+                    "message_id": message_id,
+                    "status": "error",
+                    "error_code": err.error_code,
+                    "message": err.message,
+                    "retryable": err.retryable,
+                }
+            except Exception as err:  # pragma: no cover
+                session.progress[message_id] = {
+                    "message_id": message_id,
+                    "status": "error",
+                    "error_code": "INTERNAL_ERROR",
+                    "message": f"{type(err).__name__}: {err}",
+                }
+
+        threading.Thread(target=_runner, daemon=True).start()
+        return {"message_id": message_id, "status": "processing"}
+
+    def message_status(self, session_id: str, message_id: str) -> dict[str, Any]:
+        session = self._get(session_id)
+        status = session.progress.get(message_id)
+        if status is None:
+            raise KeyError(message_id)
+        return status
 
     def undo(self, session_id: str) -> dict[str, Any]:
         session = self._get(session_id)
@@ -1183,14 +1261,20 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
         instruction: str = Form(...),
         think: bool = Form(default=False),
     ) -> dict[str, Any]:
+        # 非同期で処理開始。message_id を返し、進捗は GET .../messages/{id} で取得。
         try:
-            return await run_in_threadpool(
-                chat.post_message, session_id, instruction, think
-            )
+            return chat.start_message(session_id, instruction, think)
         except KeyError as err:
             raise HTTPException(status_code=404, detail="session not found") from err
         except JobError as err:
             raise _chat_error(err) from err
+
+    @app.get("/sessions/{session_id}/messages/{message_id}")
+    async def message_status(session_id: str, message_id: str) -> dict[str, Any]:
+        try:
+            return chat.message_status(session_id, message_id)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail="not found") from err
 
     @app.post("/sessions/{session_id}/undo")
     async def undo_session(session_id: str) -> dict[str, Any]:

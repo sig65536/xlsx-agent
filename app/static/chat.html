@@ -179,6 +179,11 @@ $("input").addEventListener("keydown", (e)=>{ if(e.key==="Enter" && !e.shiftKey)
 $("input").addEventListener("input", ()=>{ const t=$("input"); t.style.height="auto"; t.style.height=Math.min(t.scrollHeight,140)+"px"; });
 $("sendBtn").onclick = send;
 
+function showErr(bubble, d){
+  bubble.innerHTML = `<div class="notice err">⚠️ [${esc(d.error_code||"")}] ${esc(d.message||"失敗")}${d.retryable?'<br><small>再試行で成功する場合があります。</small>':''}</div>`;
+}
+const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
+
 async function send(){
   if (busy || !sessionId) return;
   const text = $("input").value.trim();
@@ -186,20 +191,33 @@ async function send(){
   addUser(text);
   $("input").value=""; $("input").style.height="auto";
   setBusy(true);
-  const pending = addBot('<span class="spinner"></span> 編集中…');
+  const pending = addBot('<span class="spinner"></span> 指示を確認中…');
+  const bubble = pending.querySelector(".bubble");
   const fd = new FormData(); fd.append("instruction", text); fd.append("think", $("thinkToggle").checked ? "true":"false");
   try {
     const res = await fetch(`sessions/${sessionId}/messages`, { method:"POST", body:fd });
     const data = await readJson(res);
-    if (!res.ok) {
-      const d = data.detail||data;
-      pending.querySelector(".bubble").innerHTML = `<div class="notice err">⚠️ [${esc(d.error_code||"")}] ${esc(d.message||"失敗")}${d.retryable?'<br><small>再試行で成功する場合があります。</small>':''}</div>`;
-    } else {
-      pending.querySelector(".bubble").innerHTML = previewHtml(data.preview);
-      $("undoBtn").disabled = !data.can_undo;
+    if (!res.ok) { showErr(bubble, data.detail||data); setBusy(false); return; }
+    const mid = data.message_id;
+    // 進捗をポーリングして phase を表示、完了で差分描画
+    while (true) {
+      await sleep(900);
+      let st;
+      try { const r = await fetch(`sessions/${sessionId}/messages/${mid}`); st = await readJson(r); }
+      catch { continue; }
+      if (st.status === "processing") {
+        bubble.innerHTML = `<span class="spinner"></span> ${esc(st.phase || "処理中…")}`;
+      } else if (st.status === "done") {
+        bubble.innerHTML = previewHtml(st.preview);
+        $("undoBtn").disabled = !st.can_undo;
+        break;
+      } else { // error
+        showErr(bubble, st);
+        break;
+      }
     }
   } catch (e) {
-    pending.querySelector(".bubble").innerHTML = `<div class="notice err">接続エラー: ${esc(e.message)}</div>`;
+    bubble.innerHTML = `<div class="notice err">接続エラー: ${esc(e.message)}</div>`;
   } finally { setBusy(false); }
 }
 function setBusy(b){ busy=b; $("sendBtn").disabled=b; $("input").disabled=b; if(!b) $("input").focus(); }

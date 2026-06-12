@@ -637,8 +637,20 @@ def run_agent(
     max_steps: int = 6,
     step_timeout: int = 30,
     think: bool | None = None,
+    progress=None,
 ) -> dict:
-    """ReActループ本体。working_path を直接編集する。失敗時 JobError。"""
+    """ReActループ本体。working_path を直接編集する。失敗時 JobError。
+
+    progress(label:str) があれば各段階で呼ばれ、UIに進捗を出せる。
+    """
+
+    def _say(label: str) -> None:
+        if progress:
+            try:
+                progress(label)
+            except Exception:
+                pass
+
     from app.common import JobError
 
     sandbox = AgentSandbox(working_path, sheet_name)
@@ -647,6 +659,7 @@ def run_agent(
     completed = False
     try:
         for step in range(1, max_steps + 1):
+            _say(f"AIが編集コードを生成中…(手{step})")
             text = llm.agent_step(summary, instruction, transcript, think=think)
             kind, code = parse_action(text)
             if kind == "done":
@@ -663,6 +676,7 @@ def run_agent(
                     }
                 )
                 continue
+            _say("生成コードを確認中…")
             try:
                 precheck_step_code(code)
             except JobError as rejected:
@@ -674,6 +688,7 @@ def run_agent(
                     }
                 )
                 continue
+            _say("編集を実行中…")
             result = sandbox.run(code, timeout=step_timeout)
             if result.get("ok"):
                 applied += 1

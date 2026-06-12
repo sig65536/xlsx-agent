@@ -523,6 +523,28 @@ def test_chat_session_flow_and_undo(tmp_path: Path) -> None:
     assert not any(m.get("role") == "user" for m in session.messages)
 
 
+def test_chat_incomplete_save_returns_note(tmp_path: Path, monkeypatch) -> None:
+    """DONE未宣言で手数上限に達しても編集は保存され、未完了の note が返ること。"""
+    import app.main as main
+
+    monkeypatch.setattr(main, "AGENT_MAX_STEPS", 2)
+
+    class NeverDone:
+        def __init__(self):
+            self.n = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.n += 1
+            return f"```python\nws['A{self.n}'] = 'v{self.n}'\n```"  # 編集・DONE無し
+
+    svc = main.SessionService(tmp_path / "s", llm=NeverDone(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+    res = svc.post_message(sid, "編集して")
+    assert res.get("note")  # 未完了の注記が付く
+    assert res["preview"]["changed_cell_count"] >= 1  # 編集は保存されている
+
+
 def test_chat_undo_limit_no_filename_collision(tmp_path: Path, monkeypatch) -> None:
     """Undo上限トリム後も版ファイル名が衝突しない（SameFileError回帰）。"""
     import app.main as main

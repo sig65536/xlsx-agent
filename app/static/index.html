@@ -107,6 +107,7 @@
   .notice { font-size: 13px; padding: 10px 14px; border-radius: 8px; margin-top: 12px; }
   .notice.err { background: var(--del); color: #ffd4d4; border: 1px solid #5a2a2a; }
   .notice.info { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+  .notice.warn { background: #3a2f12; color: #ffe2a8; border: 1px solid #5a4a1f; margin-bottom: 10px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; }
@@ -339,7 +340,7 @@ function pollJob(jobId) {
       }
       if (job.status === "preview_ready" && job.preview) {
         clearTimeout(pollTimer);
-        renderPreview(jobId, job.preview);
+        renderPreview(jobId, job.preview, job.note);
         return;
       }
     } catch (err) {
@@ -353,7 +354,7 @@ function pollJob(jobId) {
 }
 
 // プレビュー描画
-function renderPreview(jobId, preview) {
+function renderPreview(jobId, preview, note) {
   $("progressCard").classList.add("hidden");
   $("previewCard").classList.remove("hidden");
   $("changeCount").textContent = preview.changed_cell_count;
@@ -363,6 +364,7 @@ function renderPreview(jobId, preview) {
   const shown = preview.changed_cells || [];
   const truncated = preview.changed_cell_count > shown.length;
   $("previewNotes").innerHTML =
+    (note ? `<div class="notice warn">${note}</div>` : "") +
     `<div class="notice info">${(preview.notes || []).join(" / ")}` +
     (truncated ? `<br>表示は先頭 ${shown.length} 件です（全 ${preview.changed_cell_count} 件）。` : "") +
     `</div>`;

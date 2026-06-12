@@ -305,6 +305,63 @@ def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
     assert err.value.error_code == "AGENT_STEP_LIMIT"
 
 
+def test_agent_completes_on_malformed_after_applied_edit(tmp_path: Path) -> None:
+    """編集適用済みで、続く応答が実体なし（``` だけ等）なら完了として保存すること。
+
+    小型モデルは手1でコードを書いた後 DONE を出さず、手2以降に閉じフェンスだけを
+    返すことがある。これを延々 malformed 扱いにすると手数切れで編集が破棄されるため、
+    適用済みなら実質完了とみなして保存する。
+    """
+
+    class PaintThenFence:
+        def __init__(self):
+            self.calls = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.calls += 1
+            if self.calls == 1:
+                return "```python\nws['A1'] = 'painted'\n"  # 閉じ忘れ・DONE無し
+            return "```"  # 以降は閉じフェンスだけ
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    llm = PaintThenFence()
+    out = run_agent(src, "Sheet", "A1をpaintedに", {"sheet_name": "Sheet"}, llm, max_steps=6)
+    assert out["applied"] == 1
+    assert llm.calls == 2  # 手2の malformed で完了（手数を使い切らない）
+    assert load_workbook(src).active["A1"].value == "painted"
+
+
+def test_agent_prose_after_edit_does_not_early_complete(tmp_path: Path) -> None:
+    """編集後でも、散文の不正応答では早期完了させず再試行すること（Codex P1対応）。
+
+    実体のない応答（``` だけ等）のみ完了とみなし、続行/リカバリ意図があり得る
+    普通の散文は malformed として再試行 → 後続の有効コードを取りこぼさない。
+    """
+
+    class EditProseThenMore:
+        def __init__(self):
+            self.calls = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.calls += 1
+            if self.calls == 1:
+                return "```python\nws['A1'] = 'first'\n```"  # 編集適用
+            if self.calls == 2:
+                return "次の編集を考えています。"  # 散文 → ここで完了してはいけない
+            return "```python\nws['B1'] = 'second'\n```\nDONE"  # 本当の続き
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    llm = EditProseThenMore()
+    out = run_agent(src, "Sheet", "2箇所編集", {"sheet_name": "Sheet"}, llm, max_steps=6)
+    assert llm.calls == 3  # 散文で止まらず3手目まで進む
+    assert out["applied"] == 2
+    wb = load_workbook(src)
+    assert wb.active["A1"].value == "first"
+    assert wb.active["B1"].value == "second"  # 散文後の編集を取りこぼさない
+
+
 def test_agent_multistep_edit(tmp_path: Path) -> None:
     out = _run_agent_on(
         tmp_path,

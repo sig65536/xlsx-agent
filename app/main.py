@@ -183,6 +183,8 @@ class LLMClient:
             "stream": False,
             "prompt": prompt,
             "options": {"temperature": 0.1},
+            # モデルをメモリに常駐させ、毎回のロードを避けて高速化（既定30分、-1で無期限）
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "30m"),
         }
         # think を常に明示送信する。False を送ると対応モデルは思考をスキップして速くなり、
         # 非対応モデルは無視する。思考トレースは payload["thinking"] に分離される。
@@ -276,10 +278,11 @@ class LLMClient:
             "あなたはopenpyxlでExcelを編集するエージェントです。"
             f"変数 wb(Workbook), ws(対象シート '{summary.get('sheet_name', '')}'), "
             "helpers が使えます。\n"
-            "各ターンの応答は次のどちらか一つだけ:\n"
-            "  1) 次に実行するコードを ```python ... ``` で1ブロック"
-            "（print()で値を確認してよい）\n"
-            "  2) 指示が完了したら DONE の一語のみ\n"
+            "応答ルール:\n"
+            "  ・実行するコードは ```python ... ``` の1ブロックで（print()で確認可）。\n"
+            "  ・そのコードで指示が完了するなら、コードブロックの後ろに DONE の行を"
+            "付ける（1回で完了でき高速）。まだ続くときだけ DONE を付けない。\n"
+            "  ・すでに完了済みなら DONE だけを返す。\n"
             "import可能: datetime, re, math, openpyxl.styles 等"
             "（os / sys / ファイル / ネットワークは不可）。"
             "説明・思考は書かない。\n"

@@ -606,17 +606,24 @@ class AgentSandbox:
 
 
 def parse_action(text: str) -> tuple[str, str]:
-    """LLM応答を (種別, コード) に解釈する。種別は 'code' / 'done' / 'malformed'。
+    """LLM応答を (種別, コード) に解釈する。
+    種別は 'code' / 'code_done' / 'done' / 'malformed'。
 
-    DONE は「単独行が DONE」のときのみ完了とみなす（部分文字列マッチだと
-    "not done" 等の散文を誤って完了扱いし、部分編集を保存してしまうため）。
+    'code_done' は「コードブロック＋（その外側に）単独行 DONE」の応答。
+    1回の応答でコード実行と完了を兼ねるため、簡単な編集をLLM1呼び出しで終えられる。
+    DONE 判定は単独行のみ（部分文字列だと "not done" 等を誤判定するため）。
     """
     match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
+    # コードブロック外のテキストで DONE を判定する
+    outside = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    has_done = any(
+        line.strip().upper().rstrip(".!。 ") == "DONE" for line in outside.splitlines()
+    )
     if match and match.group(1).strip():
-        return "code", match.group(1).strip()
-    for line in text.strip().splitlines():
-        if line.strip().upper().rstrip(".!。 ") == "DONE":
-            return "done", ""
+        code = match.group(1).strip()
+        return ("code_done", code) if has_done else ("code", code)
+    if has_done:
+        return "done", ""
     # コードも明示的な DONE も無い → 不正応答。完了扱いにせず再試行させる。
     return "malformed", ""
 
@@ -683,6 +690,11 @@ def run_agent(
                     "observation": observation[:MAX_OBSERVATION_CHARS],
                 }
             )
+            # コード＋DONE を1回で返した応答は、成功したらそのまま完了にする
+            # （完了確認の追加LLM呼び出しを省いて高速化）。失敗時は通常どおり次手で修正。
+            if kind == "code_done" and result.get("ok"):
+                completed = True
+                break
 
         # DONE に到達せずステップ上限で打ち切った場合は、未完成の部分編集を
         # そのまま保存せず、再試行可能なエラーにする。

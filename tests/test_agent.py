@@ -109,6 +109,28 @@ def test_parse_action_code_and_done() -> None:
     # 散文や "not done" は完了扱いにしない（部分保存を防ぐ）
     assert parse_action("特に何もありません")[0] == "malformed"
     assert parse_action("I am not done yet")[0] == "malformed"
+    # コード＋DONE は code_done（1回で完了）
+    kind, code = parse_action("```python\nws['A1']=1\n```\nDONE")
+    assert kind == "code_done" and code == "ws['A1']=1"
+
+
+def test_agent_code_done_finishes_in_one_call(tmp_path: Path) -> None:
+    """コード＋DONE を1応答で返すと、LLM呼び出し1回で完了すること。"""
+
+    class OneShot:
+        def __init__(self):
+            self.calls = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.calls += 1
+            return "```python\nws['A1'] = 'done'\n```\nDONE"
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    llm = OneShot()
+    run_agent(src, "Sheet", "テスト", {"sheet_name": "Sheet"}, llm, max_steps=6)
+    assert llm.calls == 1  # 完了確認の追加呼び出しが無い
+    assert load_workbook(src).active["A1"].value == "done"
 
 
 def test_precheck_rejects_escape() -> None:

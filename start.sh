@@ -3,9 +3,11 @@
 #
 # 前提:
 #   - Python 3.10+ がインストール済み
-#   - Ollama が起動済みで、モデル gemma4:e4b が pull 済み
+#   - Ollama が起動済みで、使用モデルが pull 済み
 #       ollama serve            # 別ターミナル or systemd で常駐
-#       ollama pull gemma4:e4b  # 初回のみ（数GBのDL）
+#       ollama pull gemma4-e4b:latest  # 初回のみ（数GBのDL）
+#
+# モデル名などの設定は config.env を編集（ここ一箇所で切替）。
 #
 # 使い方:
 #   ./start.sh            # 0.0.0.0:8000 で起動。ユーザーは http://<サーバーIP>:8000 にアクセス
@@ -15,11 +17,19 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
+# 設定は config.env 一箇所で切り替え（モデル名など）。実環境変数があれば優先。
+if [ -f config.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./config.env
+  set +a
+fi
+
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://localhost:11434/api/generate}"
 OLLAMA_BASE="${OLLAMA_ENDPOINT%/api/generate}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4-e4b:latest}"
 
 # --- venv 準備 ---
 if [ ! -d ".venv" ]; then

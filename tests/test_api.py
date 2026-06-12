@@ -97,6 +97,20 @@ def test_xlsm_job_lifecycle_preserves_result_and_download_extensions(
     assert 'filename="edited.xlsm"' in content_disposition
 
 
+def test_config_env_loader(tmp_path: Path) -> None:
+    from app.main import _load_config_env
+
+    conf = tmp_path / "config.env"
+    conf.write_text(
+        "# comment\n\nOLLAMA_MODEL=gemma4-e4b:latest\nPORT = 9000\n",
+        encoding="utf-8",
+    )
+    env: dict = {"PORT": "8000"}  # 既存値は上書きしない
+    _load_config_env(conf, env)
+    assert env["OLLAMA_MODEL"] == "gemma4-e4b:latest"
+    assert env["PORT"] == "8000"  # 実環境変数が優先
+
+
 def test_keep_vba_policy_follows_extension() -> None:
     from app.main import _keep_vba_for
 

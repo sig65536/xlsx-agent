@@ -31,5 +31,5 @@ Keep the suite green and add tests for new behavior.
 
 ## Conventions
 - Python 3.10+, PEP 8, type hints. Keep changes small and consistent with the surrounding code.
-- The default LLM model id (`gemma4:e4b`) is intentional — do not change it.
+- The default LLM model id (`gemma4-e4b:latest`) is intentional — do not change it.
 - Prefer focused, high-signal review comments over style nitpicks.

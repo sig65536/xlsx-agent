@@ -112,16 +112,19 @@ def test_favicon_and_healthz(tmp_path: Path) -> None:
 
 
 def test_ollama_calls_bypass_proxy() -> None:
-    # ローカルOllamaへの通信はシステム/環境プロキシを通さない（403/HTML横取り対策）
+    # ローカルOllamaへの通信はシステム/環境プロキシを通さない（403/HTML横取り対策）。
+    # build_opener(ProxyHandler({})) は環境を読む既定ProxyHandlerを除外するので、
+    # プロキシ経由になる(=proxies が非空の)ハンドラが存在しないこと。
     from urllib.request import ProxyHandler
 
     from app.main import _NO_PROXY_OPENER
 
-    proxy_handlers = [
-        h for h in _NO_PROXY_OPENER.handlers if isinstance(h, ProxyHandler)
+    proxied = [
+        h
+        for h in _NO_PROXY_OPENER.handlers
+        if isinstance(h, ProxyHandler) and h.proxies
     ]
-    assert proxy_handlers
-    assert all(h.proxies == {} for h in proxy_handlers)
+    assert not proxied
 
 
 def test_config_env_loader(tmp_path: Path) -> None:

@@ -638,10 +638,13 @@ def run_agent(
     step_timeout: int = 30,
     think: bool | None = None,
     progress=None,
+    log_path: Path | None = None,
 ) -> dict:
     """ReActループ本体。working_path を直接編集する。失敗時 JobError。
 
     progress(label:str) があれば各段階で呼ばれ、UIに進捗を出せる。
+    log_path を渡すと、各手の生のLLM応答・実行結果をそのファイルへ追記する
+    （何が起きて手が伸びたかを後から追える。タイムアウトでも途中まで残るよう即flush）。
     """
 
     def _say(label: str) -> None:
@@ -650,6 +653,27 @@ def run_agent(
                 progress(label)
             except Exception:
                 pass
+
+    def _log(msg: str) -> None:
+        if not log_path:
+            return
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(msg + "\n")
+                fh.flush()
+        except Exception:
+            pass
+
+    from datetime import datetime
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _log("=" * 70)
+    _log(f"[{ts}] 指示: {instruction!r}")
+    _log(
+        f"model={getattr(llm, 'model', '?')} think={think} "
+        f"max_steps={max_steps} sheet={sheet_name!r}"
+    )
+    _log("-" * 70)
 
     from app.common import JobError
 
@@ -662,11 +686,15 @@ def run_agent(
             _say(f"AIが編集コードを生成中…(手{step})")
             text = llm.agent_step(summary, instruction, transcript, think=think)
             kind, code = parse_action(text)
+            _log(f"--- 手{step} (kind={kind}) ---")
+            _log("[LLM応答]\n" + (text or "").strip()[:MAX_OBSERVATION_CHARS])
             if kind == "done":
                 completed = True
+                _log("[結果] DONE（完了宣言）")
                 break
             if kind == "malformed":
                 # 散文や不正応答は完了扱いにせず、コード or DONE を促して再試行
+                _log("[結果] MALFORMED（コードもDONEも無い不正応答）")
                 transcript.append(
                     {
                         "step": step,
@@ -680,6 +708,7 @@ def run_agent(
             try:
                 precheck_step_code(code)
             except JobError as rejected:
+                _log(f"[結果] REJECTED（安全チェック）: {rejected.message}")
                 transcript.append(
                     {
                         "step": step,
@@ -698,6 +727,7 @@ def run_agent(
                 observation = "ERROR:\n" + (
                     result.get("error") or result.get("stdout") or "unknown error"
                 )
+            _log("[実行結果] " + observation[:MAX_OBSERVATION_CHARS])
             transcript.append(
                 {
                     "step": step,
@@ -709,11 +739,13 @@ def run_agent(
             # （完了確認の追加LLM呼び出しを省いて高速化）。失敗時は通常どおり次手で修正。
             if kind == "code_done" and result.get("ok"):
                 completed = True
+                _log("[結果] コード＋DONEで実行成功 → 完了")
                 break
 
         # DONE に到達せずステップ上限で打ち切った場合は、未完成の部分編集を
         # そのまま保存せず、再試行可能なエラーにする。
         if not completed:
+            _log(f"[終了] 失敗: ステップ上限({max_steps})に到達。編集は破棄。 steps={len(transcript)} applied={applied}")
             raise JobError(
                 "AGENT_STEP_LIMIT",
                 f"ステップ上限({max_steps})に達しました。指示を分割するか "
@@ -721,6 +753,7 @@ def run_agent(
                 retryable=True,
             )
         if applied == 0:
+            _log("[終了] 失敗: 有効な編集なし（AGENT_NO_CHANGES）")
             raise JobError(
                 "AGENT_NO_CHANGES",
                 "エージェントが有効な編集を生成できませんでした",
@@ -728,10 +761,12 @@ def run_agent(
             )
         save_result = sandbox.save(str(working_path), timeout=step_timeout)
         if not save_result.get("ok"):
+            _log(f"[終了] 失敗: 保存エラー {save_result.get('error', '')}")
             raise JobError(
                 save_result.get("error_code", "EXCEL_SAVE_VALIDATION_FAILED"),
                 f"保存に失敗しました: {save_result.get('error', '')}",
             )
+        _log(f"[終了] 成功: steps={len(transcript)} applied={applied}")
     finally:
         sandbox.close()
     return {"steps": len(transcript), "applied": applied, "transcript": transcript}

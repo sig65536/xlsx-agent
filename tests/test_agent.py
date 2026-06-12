@@ -411,6 +411,32 @@ def test_chat_undo_limit_no_filename_collision(tmp_path: Path, monkeypatch) -> N
     assert all(p.exists() for p in session.versions)
 
 
+def test_chat_async_message_status_flow(tmp_path: Path) -> None:
+    """start_message→message_status のポーリングで done と preview が得られること。"""
+    from app.main import SessionService
+
+    class Stub:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            return "```python\nws['A1'] = 'x'\n```\nDONE"
+
+    svc = SessionService(tmp_path / "s", llm=Stub(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+    mid = svc.start_message(sid, "A1をxに")["message_id"]
+
+    status = {}
+    for _ in range(100):
+        status = svc.message_status(sid, mid)
+        if status["status"] != "processing":
+            break
+        time.sleep(0.05)
+    assert status["status"] == "done", status
+    assert status["preview"]["changed_cell_count"] >= 1
+    wb = load_workbook(svc.current_path(sid))
+    assert wb.active["A1"].value == "x"
+    wb.close()
+
+
 def test_chat_session_serializes_concurrent_messages(tmp_path: Path) -> None:
     """同一セッションへの同時メッセージが直列化され、版が破損しないこと。"""
     import threading

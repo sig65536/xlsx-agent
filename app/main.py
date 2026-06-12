@@ -19,7 +19,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
 from starlette.concurrency import run_in_threadpool
@@ -1100,6 +1100,18 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception(_request, exc: Exception) -> JSONResponse:
+        # 未処理例外でも JSON で返す（フロントが "Internal Server Error" を
+        # JSON.parse して落ちるのを防ぎ、原因をUIに表示できるようにする）。
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": "INTERNAL_ERROR",
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        )
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, Any]:

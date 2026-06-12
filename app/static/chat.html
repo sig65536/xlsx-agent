@@ -114,6 +114,13 @@
 const $ = (id) => document.getElementById(id);
 let sessionId = null, busy = false;
 
+// レスポンスをJSONとして読む。JSONでない(500のプレーンテキスト等)場合も落ちず本文を返す
+async function readJson(res){
+  const raw = await res.text();
+  try { return JSON.parse(raw); }
+  catch { return { message: (raw || "").slice(0, 400) || `HTTP ${res.status}` }; }
+}
+
 function esc(s){ if(s===null||s===undefined||s==="") return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function fmtVal(v){ return (v===null||v===undefined||v==="") ? '<span class="val-empty">（空）</span>' : esc(v); }
 
@@ -132,7 +139,7 @@ async function uploadFile(file) {
   const fd = new FormData(); fd.append("file", file);
   try {
     const res = await fetch("sessions", { method:"POST", body:fd });
-    const data = await res.json();
+    const data = await readJson(res);
     if (!res.ok) { $("uploadError").innerHTML = `<div class="notice err">${esc((data.detail||data).message||"失敗")}</div>`; return; }
     sessionId = data.session_id;
     $("fileLabel").textContent = `📄 ${file.name}（シート: ${esc(data.active_sheet)}）`;
@@ -183,7 +190,7 @@ async function send(){
   const fd = new FormData(); fd.append("instruction", text); fd.append("think", $("thinkToggle").checked ? "true":"false");
   try {
     const res = await fetch(`sessions/${sessionId}/messages`, { method:"POST", body:fd });
-    const data = await res.json();
+    const data = await readJson(res);
     if (!res.ok) {
       const d = data.detail||data;
       pending.querySelector(".bubble").innerHTML = `<div class="notice err">⚠️ [${esc(d.error_code||"")}] ${esc(d.message||"失敗")}${d.retryable?'<br><small>再試行で成功する場合があります。</small>':''}</div>`;
@@ -202,7 +209,7 @@ $("undoBtn").onclick = async () => {
   if (!sessionId) return;
   try {
     const res = await fetch(`sessions/${sessionId}/undo`, { method:"POST" });
-    const data = await res.json();
+    const data = await readJson(res);
     if (res.ok) { addSystem("↶ 1手戻しました"); $("undoBtn").disabled = !data.can_undo; }
     else addSystem((data.detail||data).message || "戻せません");
   } catch (e) { addSystem("Undo失敗: " + e.message); }

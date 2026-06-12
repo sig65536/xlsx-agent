@@ -687,7 +687,9 @@ def run_agent(
             text = llm.agent_step(summary, instruction, transcript, think=think)
             kind, code = parse_action(text)
             _log(f"--- 手{step} (kind={kind}) ---")
-            _log("[LLM応答]\n" + (text or "").strip()[:MAX_OBSERVATION_CHARS])
+            # ログはローカルのデバッグ用途なので丸めない（LLMへ渡す transcript のみ
+            # MAX_OBSERVATION_CHARS で制限する）。thinking出力や長文でも全文残す。
+            _log("[LLM応答]\n" + (text or "").strip())
             if kind == "done":
                 completed = True
                 _log("[結果] DONE（完了宣言）")
@@ -727,7 +729,7 @@ def run_agent(
                 observation = "ERROR:\n" + (
                     result.get("error") or result.get("stdout") or "unknown error"
                 )
-            _log("[実行結果] " + observation[:MAX_OBSERVATION_CHARS])
+            _log("[実行結果] " + observation)  # ログは全文（長いトレースも切らない）
             transcript.append(
                 {
                     "step": step,

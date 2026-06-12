@@ -199,6 +199,14 @@ class LLMClient:
                     f"Ollamaにモデル '{model}' が見つかりません。"
                     f"サーバーで `ollama pull {self.model}` を実行してください。{detail}",
                 ) from exc
+            if exc.code == 403:
+                raise JobError(
+                    "LLM_FORBIDDEN",
+                    "Ollamaが403を返しました（Host/Origin保護による拒否）。"
+                    "Ollama側で環境変数 OLLAMA_HOST=0.0.0.0 を設定して再起動するか、"
+                    "OLLAMA_ENDPOINT が localhost/127.0.0.1 を指しているか確認してください。"
+                    f" {detail}",
+                ) from exc
             raise JobError(
                 "LLM_HTTP_ERROR",
                 f"LLM呼び出しがHTTP {exc.code} を返しました: {detail}",

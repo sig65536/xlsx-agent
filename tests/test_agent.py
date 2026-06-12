@@ -132,6 +132,11 @@ def test_parse_action_tolerates_fence_variants() -> None:
     assert kind == "code" and code == "ws['A3']=9"
     # 散文は引き続き malformed
     assert parse_action("カタカナのセルを青く塗ります")[0] == "malformed"
+    # フェンス無しコード＋DONE は code を取りこぼさず code_done にする（順序バグ回帰防止）
+    kind, code = parse_action("ws['A2']=2\nDONE")
+    assert kind == "code_done" and code == "ws['A2']=2"
+    kind, code = parse_action("from openpyxl.styles import PatternFill\nws['A1']=1\nDONE")
+    assert kind == "code_done" and "ws['A1']=1" in code and "DONE" not in code
 
 
 def test_agent_code_done_finishes_in_one_call(tmp_path: Path) -> None:
@@ -289,18 +294,41 @@ def test_agent_preserves_vars_across_rollback(tmp_path: Path) -> None:
     assert wb.active["B1"].value == "5"        # counter は保持されている
 
 
-def test_agent_step_limit_does_not_save_partial(tmp_path: Path) -> None:
-    """DONEに到達せずステップ上限で打ち切ったら部分保存せずエラーにする。"""
+def test_agent_step_limit_with_edits_saves_as_incomplete(tmp_path: Path) -> None:
+    """DONE未宣言で手数上限に達しても、編集が適用済みなら破棄せず保存し
+    completed=False（未完了）で返すこと。弱いモデルが完了を明示できないだけで
+    成果がある場合に、全破棄してしまう退行を防ぐ。"""
 
     class NeverDoneLLM:
+        def __init__(self):
+            self.n = 0
+
         def agent_step(self, summary, instruction, transcript, think=None):
-            return "```python\nws['A1'] = 'x'\n```"
+            self.n += 1
+            return f"```python\nws['A{self.n}'] = 'v{self.n}'\n```"  # 毎手編集・DONE無し
+
+    src = tmp_path / "input.xlsx"
+    src.write_bytes(_workbook_bytes())
+    out = run_agent(
+        src, "Sheet", "テスト", {"sheet_name": "Sheet"}, NeverDoneLLM(), max_steps=2
+    )
+    assert out["completed"] is False  # 未完了として通知
+    assert out["applied"] == 2
+    assert load_workbook(src).active["A1"].value == "v1"  # 編集は破棄されず保存される
+
+
+def test_agent_step_limit_without_edits_raises(tmp_path: Path) -> None:
+    """編集が1件も適用できないまま手数上限なら、従来どおり再試行エラーにする。"""
+
+    class BadCodeLLM:
+        def agent_step(self, summary, instruction, transcript, think=None):
+            return "```python\n1 / 0\n```"  # 毎手エラー → applied=0
 
     src = tmp_path / "input.xlsx"
     src.write_bytes(_workbook_bytes())
     with pytest.raises(JobError) as err:
         run_agent(
-            src, "Sheet", "テスト", {"sheet_name": "Sheet"}, NeverDoneLLM(), max_steps=2
+            src, "Sheet", "テスト", {"sheet_name": "Sheet"}, BadCodeLLM(), max_steps=2
         )
     assert err.value.error_code == "AGENT_STEP_LIMIT"
 
@@ -493,6 +521,28 @@ def test_chat_session_flow_and_undo(tmp_path: Path) -> None:
     wb2.close()
     session = svc._get(sid)
     assert not any(m.get("role") == "user" for m in session.messages)
+
+
+def test_chat_incomplete_save_returns_note(tmp_path: Path, monkeypatch) -> None:
+    """DONE未宣言で手数上限に達しても編集は保存され、未完了の note が返ること。"""
+    import app.main as main
+
+    monkeypatch.setattr(main, "AGENT_MAX_STEPS", 2)
+
+    class NeverDone:
+        def __init__(self):
+            self.n = 0
+
+        def agent_step(self, summary, instruction, transcript, think=None):
+            self.n += 1
+            return f"```python\nws['A{self.n}'] = 'v{self.n}'\n```"  # 編集・DONE無し
+
+    svc = main.SessionService(tmp_path / "s", llm=NeverDone(), mode="agent")
+    upload = UploadFile(file=io.BytesIO(_workbook_bytes()), filename="s.xlsx")
+    sid = svc.create_session(upload, None)["session_id"]
+    res = svc.post_message(sid, "編集して")
+    assert res.get("note")  # 未完了の注記が付く
+    assert res["preview"]["changed_cell_count"] >= 1  # 編集は保存されている
 
 
 def test_chat_undo_limit_no_filename_collision(tmp_path: Path, monkeypatch) -> None:

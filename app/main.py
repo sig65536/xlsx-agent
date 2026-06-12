@@ -103,6 +103,7 @@ class Job:
     message: str | None = None
     retryable: bool = False
     preview: dict[str, Any] | None = None
+    note: str | None = None
     result_path: Path | None = None
     download_token: str | None = None
 
@@ -866,7 +867,7 @@ class JobService:
                 from app import agent
 
                 job.status = JobStatus.GENERATING
-                agent.run_agent(
+                run_result = agent.run_agent(
                     result_path,
                     sheet_name,
                     job.instruction,
@@ -876,6 +877,13 @@ class JobService:
                     step_timeout=AGENT_STEP_TIMEOUT,
                     log_path=(job.work_dir / "agent.log") if AGENT_LOG else None,
                 )
+                # DONE未宣言で手数上限に達したが編集は適用済み、という場合は
+                # チャット経路と同様に「未完了かもしれない」ことを通知する。
+                if not run_result.get("completed", True):
+                    job.note = (
+                        "AIが完了を明示しなかったため、ここまでに適用できた編集だけ保存しました。"
+                        "追加で編集したい場合は、より具体的な指示で再実行してください。"
+                    )
 
             job.preview = _create_preview(job.source_path, result_path, sheet_name)
             job.result_path = result_path
@@ -1023,7 +1031,7 @@ class SessionService:
             try:
                 from app import agent
 
-                agent.run_agent(
+                run_result = agent.run_agent(
                     candidate,
                     sheet_name,
                     self._augment(session, instruction),
@@ -1049,7 +1057,15 @@ class SessionService:
             session.messages.append({"role": "user", "text": instruction})
             session.messages.append({"role": "assistant", "preview": preview})
             can_undo = len(session.versions) > 1
-        return {"preview": preview, "can_undo": can_undo}
+        out: dict[str, Any] = {"preview": preview, "can_undo": can_undo}
+        # DONE未宣言のまま手数上限で打ち切ったが編集は適用済み、という場合は
+        # 「未完了かもしれない」ことをUIに伝える（成果は保存済み・続けて指示できる）。
+        if not run_result.get("completed", True):
+            out["note"] = (
+                "AIが完了を明示しなかったため、ここまでに適用できた編集だけ保存しました。"
+                "続けて指示すれば追加で編集できます。"
+            )
+        return out
 
     def post_message(
         self, session_id: str, instruction: str, think: bool | None = None
@@ -1182,6 +1198,8 @@ def _to_job_response(job: Job) -> dict[str, Any]:
         )
     if job.preview:
         data["preview"] = job.preview
+    if job.note:
+        data["note"] = job.note
     return data
 
 

@@ -61,7 +61,7 @@ http://<サーバーPCのIP>:8000
 |---|---|---|
 | `OLLAMA_ENDPOINT` | `http://127.0.0.1:11434/api/generate` | Ollama の generate API |
 | `OLLAMA_MODEL` | `gemma4-e4b:latest` | 使用モデル名 |
-| `LLM_TIMEOUT_SECONDS` | `60` | LLM応答のタイムアウト |
+| `LLM_TIMEOUT_SECONDS` | `300` | LLM応答のタイムアウト |
 | `JOB_ROOT` | `./data/jobs` | ジョブ作業ディレクトリ |
 | `CORS_ORIGINS` | `*` | 許可オリジン（カンマ区切り。特定オリジンに限定する場合に指定） |
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | 待ち受けポート・ホスト |

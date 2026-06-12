@@ -119,7 +119,8 @@ class LLMClient:
             "OLLAMA_ENDPOINT", "http://127.0.0.1:11434/api/generate"
         )
         self.model = os.getenv("OLLAMA_MODEL", "gemma4-e4b:latest")
-        self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+        # CPU推論は1呼び出しに数十秒〜かかるため、既定を長めにする（config.envで調整可）
+        self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "300"))
         # thinking(推論)モード。gemma4 等の対応モデルで思考トレースを有効化する。
         # CPU推論では遅くなるため既定はオフ。Ollamaは thinking を response と分離する。
         self.think = os.getenv("XLSX_AGENT_THINK", "0").lower() not in ("0", "false", "")
@@ -183,8 +184,9 @@ class LLMClient:
             "prompt": prompt,
             "options": {"temperature": 0.1},
         }
-        if self.think if think is None else think:
-            body["think"] = True  # 思考トレースは payload["thinking"] に分離される
+        # think を常に明示送信する。False を送ると対応モデルは思考をスキップして速くなり、
+        # 非対応モデルは無視する。思考トレースは payload["thinking"] に分離される。
+        body["think"] = bool(self.think if think is None else think)
         data = json.dumps(body).encode("utf-8")
         req = Request(
             self.endpoint,
@@ -222,9 +224,15 @@ class LLMClient:
                 f"LLM呼び出しがHTTP {exc.code} を返しました: {detail}",
                 retryable=True,
             ) from exc
-        except URLError as exc:
+        except OSError as exc:
+            # URLError / TimeoutError(socket.timeout) / 接続エラーをまとめて捕捉。
+            # （旧コードは URLError のみ捕捉で、読み取りタイムアウトの TimeoutError が
+            #   素通りして 500 になっていた）
             raise JobError(
-                "LLM_TIMEOUT", f"LLM呼び出しに失敗しました: {exc}", retryable=True
+                "LLM_TIMEOUT",
+                f"LLM呼び出しがタイムアウト/失敗しました: {exc}。"
+                "モデルが遅い場合は config.env の LLM_TIMEOUT_SECONDS を増やしてください。",
+                retryable=True,
             ) from exc
         return payload.get("response", "")
 

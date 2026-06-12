@@ -111,6 +111,19 @@ def test_favicon_and_healthz(tmp_path: Path) -> None:
     assert health.json()["status"] == "ok"
 
 
+def test_ollama_calls_bypass_proxy() -> None:
+    # ローカルOllamaへの通信はシステム/環境プロキシを通さない（403/HTML横取り対策）
+    from urllib.request import ProxyHandler
+
+    from app.main import _NO_PROXY_OPENER
+
+    proxy_handlers = [
+        h for h in _NO_PROXY_OPENER.handlers if isinstance(h, ProxyHandler)
+    ]
+    assert proxy_handlers
+    assert all(h.proxies == {} for h in proxy_handlers)
+
+
 def test_config_env_loader(tmp_path: Path) -> None:
     from app.main import _load_config_env
 

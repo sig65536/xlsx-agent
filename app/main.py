@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,6 +105,12 @@ class Job:
     download_token: str | None = None
 
 
+# Ollama はローカル(127.0.0.1)なので、システム/環境のプロキシを通さない opener を使う。
+# 社内プロキシやセキュリティソフトが localhost を横取りして 403/HTML を返すのを防ぐ
+# （Ollama CLI はループバックをプロキシ除外するが、urllib は既定でプロキシ経由になる）。
+_NO_PROXY_OPENER = build_opener(ProxyHandler({}))
+
+
 class LLMClient:
     def __init__(self) -> None:
         self.endpoint = os.getenv(
@@ -126,7 +132,7 @@ class LLMClient:
 
     def _list_models(self, timeout: int | None = None) -> list[str]:
         req = Request(self._tags_endpoint, method="GET")
-        with urlopen(req, timeout=timeout or self.timeout) as resp:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout or self.timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         return [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
 
@@ -187,7 +193,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with _NO_PROXY_OPENER.open(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             detail = ""
@@ -204,9 +210,11 @@ class LLMClient:
             if exc.code == 403:
                 raise JobError(
                     "LLM_FORBIDDEN",
-                    "Ollamaが403を返しました（Host/Origin保護による拒否）。"
-                    "Ollama側で環境変数 OLLAMA_HOST=0.0.0.0 を設定して再起動するか、"
-                    "OLLAMA_ENDPOINT が localhost/127.0.0.1 を指しているか確認してください。"
+                    "Ollamaが403を返しました。多くは (1) localhost通信を横取りする"
+                    "プロキシ/セキュリティソフト、または (2) OllamaのCORS保護が原因です。"
+                    "(1)は本アプリがプロキシを除外して呼ぶので解消されるはず。残る場合は"
+                    "Ollama側で OLLAMA_ORIGINS=* を設定して再起動してください"
+                    "（OLLAMA_HOST は変更しない）。"
                     f" {detail}",
                 ) from exc
             raise JobError(

@@ -90,7 +90,7 @@ http://<サーバーPCのIP>:8000
 | `PORT` | `8000` | 待ち受けポート |
 | `HOST` | `0.0.0.0` | 待ち受けホスト |
 | `OLLAMA_MODEL` | `gemma4-e4b:latest` | 使用モデル |
-| `OLLAMA_ENDPOINT` | `http://localhost:11434/api/generate` | Ollama の API |
+| `OLLAMA_ENDPOINT` | `http://127.0.0.1:11434/api/generate` | Ollama の API |
 | `LLM_TIMEOUT_SECONDS` | `60` | LLM応答タイムアウト |
 | `CORS_ORIGINS` | `*` | 許可するアクセス元（カンマ区切りで限定可） |
 

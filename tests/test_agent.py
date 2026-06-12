@@ -114,6 +114,26 @@ def test_parse_action_code_and_done() -> None:
     assert kind == "code_done" and code == "ws['A1']=1"
 
 
+def test_parse_action_tolerates_fence_variants() -> None:
+    """小型モデルのフェンス揺れ（閉じ忘れ・''' / ~~~・ベタ書き）でも拾うこと。"""
+    # 報告ケース: ``` で開いて閉じフェンスが無い
+    kind, code = parse_action("```python\nws['A1']='x'\nws['A2']='y'\n")
+    assert kind == "code" and "ws['A1']='x'" in code and "```" not in code
+    # 閉じ忘れ＋末尾DONE は code_done（DONEはコードから分離）
+    kind, code = parse_action("```python\nws['A1']='x'\nDONE\n")
+    assert kind == "code_done" and code == "ws['A1']='x'"
+    # ''' / ~~~ フェンス
+    assert parse_action("'''python\nws['A1']=1\n'''")[0] == "code"
+    assert parse_action("~~~py\nws['A2']=2\n")[0] == "code"
+    # フェンス無しのベタ書きコードも実行を試みる
+    assert parse_action("from openpyxl.styles import PatternFill\nws['A1']=1")[0] == "code"
+    # 言語名が独立行で来るケース
+    kind, code = parse_action("```\npython\nws['A3']=9\n```")
+    assert kind == "code" and code == "ws['A3']=9"
+    # 散文は引き続き malformed
+    assert parse_action("カタカナのセルを青く塗ります")[0] == "malformed"
+
+
 def test_agent_code_done_finishes_in_one_call(tmp_path: Path) -> None:
     """コード＋DONE を1応答で返すと、LLM呼び出し1回で完了すること。"""
 

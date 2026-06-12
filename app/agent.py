@@ -605,25 +605,75 @@ class AgentSandbox:
                 pass
 
 
+# コードフェンスの揺れに対応する。小型モデルは ``` の代わりに ''' や ~~~ を使ったり、
+# 言語名を付けなかったり、閉じフェンスを忘れたりする。これらを malformed 扱いにすると
+# コードを書いているのに延々と手を浪費するため、フェンス種別と閉じ忘れを許容する。
+_FENCE = r"(?:```|'''|~~~)"
+
+
+def _strip_done_lines(block: str) -> tuple[str, bool]:
+    """ブロックから単独行の DONE を取り除き、(残り, DONEがあったか) を返す。
+    DONE 判定は単独行のみ（"not done" 等の部分一致を誤判定しないため）。"""
+    kept: list[str] = []
+    found = False
+    for line in block.splitlines():
+        if line.strip().upper().rstrip(".!。 ") == "DONE":
+            found = True
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), found
+
+
 def parse_action(text: str) -> tuple[str, str]:
     """LLM応答を (種別, コード) に解釈する。
     種別は 'code' / 'code_done' / 'done' / 'malformed'。
 
-    'code_done' は「コードブロック＋（その外側に）単独行 DONE」の応答。
-    1回の応答でコード実行と完了を兼ねるため、簡単な編集をLLM1呼び出しで終えられる。
-    DONE 判定は単独行のみ（部分文字列だと "not done" 等を誤判定するため）。
+    'code_done' は「コード＋（外側に）単独行 DONE」の応答で、1応答で実行と完了を兼ねる。
+    ``` だけでなく ''' / ~~~、閉じフェンス忘れ、フェンス無しのベタ書きにも対応する。
     """
-    match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
-    # コードブロック外のテキストで DONE を判定する
-    outside = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = text or ""
+    # 1) 閉じフェンスありのコードブロック（``` ''' ~~~ いずれも・言語名は任意）
+    match = re.search(
+        rf"{_FENCE}[ \t]*(?:python|py)?[ \t]*\r?\n(.*?){_FENCE}",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        # 2) 閉じフェンスを付け忘れた場合は、開きフェンス以降を全部コードとみなす
+        match = re.search(
+            rf"{_FENCE}[ \t]*(?:python|py)?[ \t]*\r?\n(.*)\Z",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    code = ""
+    if match and match.group(1).strip():
+        code = match.group(1).strip()
+        # "```\npython\n..." のように言語名が独立行で来るケースを除去
+        code = re.sub(r"\A(?:python|py)[ \t]*\r?\n", "", code, flags=re.IGNORECASE)
+
+    # コードブロック外のテキストで DONE を判定（閉じ忘れ分も含めフェンス区間を除去）
+    outside = re.sub(rf"{_FENCE}.*?{_FENCE}", " ", text, flags=re.DOTALL)
+    outside = re.sub(rf"{_FENCE}.*\Z", " ", outside, flags=re.DOTALL)
     has_done = any(
         line.strip().upper().rstrip(".!。 ") == "DONE" for line in outside.splitlines()
     )
-    if match and match.group(1).strip():
-        code = match.group(1).strip()
-        return ("code_done", code) if has_done else ("code", code)
+    if code:
+        # 閉じ忘れ抽出だと DONE がコード末尾に混ざることがあるので分離する
+        code, done_in_code = _strip_done_lines(code)
+        if code:
+            return ("code_done", code) if (has_done or done_in_code) else ("code", code)
     if has_done:
         return "done", ""
+    # 3) フェンスが全く無くても、openpyxl 操作らしき記述があれば実行を試みる
+    #    （散文・思考は除外しつつ、ベタ書きコードを malformed で捨てない）。
+    if re.search(
+        r"(?m)^\s*(?:from\s+openpyxl|import\s+\w|ws\s*[\[.=]|wb\s*[\[.=]|"
+        r"for\s+\w+\s+in\b|helpers\b)",
+        text,
+    ):
+        body, done_in_code = _strip_done_lines(text.strip())
+        if body:
+            return ("code_done", body) if done_in_code else ("code", body)
     # コードも明示的な DONE も無い → 不正応答。完了扱いにせず再試行させる。
     return "malformed", ""
 

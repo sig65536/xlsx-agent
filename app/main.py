@@ -108,7 +108,9 @@ class Job:
 class LLMClient:
     def __init__(self) -> None:
         self.endpoint = os.getenv(
-            "OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"
+            # localhost は Windows で IPv6(::1) に解決され Ollama(IPv4)へ繋がらず
+            # 10061(接続拒否)になることがあるため、既定は 127.0.0.1 を使う。
+            "OLLAMA_ENDPOINT", "http://127.0.0.1:11434/api/generate"
         )
         self.model = os.getenv("OLLAMA_MODEL", "gemma4-e4b:latest")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))

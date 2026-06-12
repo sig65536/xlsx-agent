@@ -33,6 +33,34 @@ from app.common import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+CONFIG_ENV_PATH = Path(__file__).resolve().parent.parent / "config.env"
+
+
+def _load_config_env(path: Path | None = None, env: dict | None = None) -> None:
+    """config.env を読み、未設定の環境変数だけ補う。
+
+    モデル名などの設定を「config.env 一箇所」で切り替えられるようにするための仕組み。
+    優先順位は 実環境変数 > config.env > コード内の既定値。
+    """
+    path = path or CONFIG_ENV_PATH
+    env = env if env is not None else os.environ
+    if not path.exists():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in env:
+                env[key] = val
+    except Exception:
+        pass
+
+
+_load_config_env()
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
@@ -82,7 +110,7 @@ class LLMClient:
         self.endpoint = os.getenv(
             "OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"
         )
-        self.model = os.getenv("OLLAMA_MODEL", "gemma4:latest")
+        self.model = os.getenv("OLLAMA_MODEL", "gemma4-e4b:latest")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
         # thinking(推論)モード。gemma4 等の対応モデルで思考トレースを有効化する。
         # CPU推論では遅くなるため既定はオフ。Ollamaは thinking を response と分離する。

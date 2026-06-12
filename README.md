@@ -1,6 +1,6 @@
 # xlsx-agent
 
-ローカルLLM（Ollama / gemma4:latest）でExcelを自然言語編集するツール。
+ローカルLLM（Ollama / gemma4-e4b:latest）でExcelを自然言語編集するツール。
 
 ユーザーは**ブラウザからアクセスするだけ**。アップロードされたファイルは**サーバーPC**で
 解析・編集され、差分プレビューを確認・承認してからダウンロードします。元ファイルは
@@ -13,7 +13,7 @@
 ```
 [ユーザーPC: ブラウザ]  ──HTTP──▶  [サーバーPC]
    ・ファイルをアップロード              ・FastAPI (このアプリ)
-   ・指示を入力                          ・Ollama + gemma4:latest （ローカルLLM）
+   ・指示を入力                          ・Ollama + gemma4-e4b:latest （ローカルLLM）
    ・差分プレビューを確認・承認          ・openpyxl でExcelを編集
    ・編集済みファイルをDL                ・サンドボックスでコード実行
 ```
@@ -24,7 +24,7 @@
 
 ```bash
 # 1) モデルを取得（初回のみ・約9.6GBのDL）
-ollama pull gemma4:latest
+ollama pull gemma4-e4b:latest
 ollama serve            # 常駐していなければ起動（systemd等でもOK）
 
 # 2) このリポジトリを取得して起動
@@ -54,10 +54,13 @@ http://<サーバーPCのIP>:8000
 
 ## 環境変数
 
+以下は環境変数で指定できますが、**`config.env`（リポジトリ直下）に書けば一箇所でまとめて
+設定**できます（→「モデル名の設定」参照）。
+
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `OLLAMA_ENDPOINT` | `http://localhost:11434/api/generate` | Ollama の generate API |
-| `OLLAMA_MODEL` | `gemma4:latest` | 使用モデル名 |
+| `OLLAMA_MODEL` | `gemma4-e4b:latest` | 使用モデル名 |
 | `LLM_TIMEOUT_SECONDS` | `60` | LLM応答のタイムアウト |
 | `JOB_ROOT` | `./data/jobs` | ジョブ作業ディレクトリ |
 | `CORS_ORIGINS` | `*` | 許可オリジン（カンマ区切り。特定オリジンに限定する場合に指定） |
@@ -99,14 +102,21 @@ OSレベルの隔離を適用しています（万一それらを抜けても実
 
 従来の単発方式に戻したい場合は `XLSX_AGENT_MODE=oneshot` を指定してください。
 
-### モデル名について
+### モデル名の設定（一箇所で切替）
 
-`gemma4:e4b` は Ollama 上では「latest」エイリアスでもあります。`ollama pull gemma4`
-で取得すると `gemma4:latest` という名前で保存されるため、設定値と食い違って 404
-（model not found）になることがあります。本アプリは Ollama の `/api/tags` を参照し、
-**ベース名 `gemma4` が一致する実際のタグ（`gemma4:e4b` / `gemma4:latest` 等）へ自動で
-寄せる**ため、どちらの名前で pull していても動作します。見つからない場合は
-`LLM_MODEL_NOT_FOUND` エラーで pull コマンドを案内します。
+モデル名などの設定は、リポジトリ直下の **`config.env` を編集すれば一括で切り替わります**
+（`start.sh` / `start.bat` / アプリ本体すべてがこの値を参照）。サーバーで `ollama list` に
+表示される名前に合わせてください。
+
+```ini
+# config.env
+OLLAMA_MODEL=gemma4-e4b:latest
+```
+
+優先順位は **実環境変数 > config.env > コード内の既定値**。さらに本アプリは Ollama の
+`/api/tags` を参照し、**ベース名が一致する実際のタグ（`...:latest` など）へ自動で寄せる**
+ため、多少の表記揺れがあっても動作します。見つからない場合は `LLM_MODEL_NOT_FOUND`
+エラーで pull コマンドを案内します。
 
 ## API
 

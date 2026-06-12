@@ -1,6 +1,6 @@
 # xlsx-agent
 
-ローカルLLM（Ollama / gemma4:e4b）でExcelを自然言語編集するツール。
+ローカルLLM（Ollama / gemma4:latest）でExcelを自然言語編集するツール。
 
 ユーザーは**ブラウザからアクセスするだけ**。アップロードされたファイルは**サーバーPC**で
 解析・編集され、差分プレビューを確認・承認してからダウンロードします。元ファイルは
@@ -13,7 +13,7 @@
 ```
 [ユーザーPC: ブラウザ]  ──HTTP──▶  [サーバーPC]
    ・ファイルをアップロード              ・FastAPI (このアプリ)
-   ・指示を入力                          ・Ollama + gemma4:e4b （ローカルLLM）
+   ・指示を入力                          ・Ollama + gemma4:latest （ローカルLLM）
    ・差分プレビューを確認・承認          ・openpyxl でExcelを編集
    ・編集済みファイルをDL                ・サンドボックスでコード実行
 ```
@@ -24,7 +24,7 @@
 
 ```bash
 # 1) モデルを取得（初回のみ・約9.6GBのDL）
-ollama pull gemma4:e4b
+ollama pull gemma4:latest
 ollama serve            # 常駐していなければ起動（systemd等でもOK）
 
 # 2) このリポジトリを取得して起動
@@ -57,7 +57,7 @@ http://<サーバーPCのIP>:8000
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `OLLAMA_ENDPOINT` | `http://localhost:11434/api/generate` | Ollama の generate API |
-| `OLLAMA_MODEL` | `gemma4:e4b` | 使用モデル名 |
+| `OLLAMA_MODEL` | `gemma4:latest` | 使用モデル名 |
 | `LLM_TIMEOUT_SECONDS` | `60` | LLM応答のタイムアウト |
 | `JOB_ROOT` | `./data/jobs` | ジョブ作業ディレクトリ |
 | `CORS_ORIGINS` | `*` | 許可オリジン（カンマ区切り。特定オリジンに限定する場合に指定） |

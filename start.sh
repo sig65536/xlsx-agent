@@ -3,9 +3,9 @@
 #
 # 前提:
 #   - Python 3.10+ がインストール済み
-#   - Ollama が起動済みで、モデル gemma4:e4b が pull 済み
+#   - Ollama が起動済みで、モデル gemma4:latest が pull 済み
 #       ollama serve            # 別ターミナル or systemd で常駐
-#       ollama pull gemma4:e4b  # 初回のみ（数GBのDL）
+#       ollama pull gemma4:latest  # 初回のみ（数GBのDL）
 #
 # 使い方:
 #   ./start.sh            # 0.0.0.0:8000 で起動。ユーザーは http://<サーバーIP>:8000 にアクセス
@@ -19,7 +19,7 @@ PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://localhost:11434/api/generate}"
 OLLAMA_BASE="${OLLAMA_ENDPOINT%/api/generate}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:latest}"
 
 # --- venv 準備 ---
 if [ ! -d ".venv" ]; then

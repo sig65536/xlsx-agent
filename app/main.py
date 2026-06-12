@@ -82,7 +82,7 @@ class LLMClient:
         self.endpoint = os.getenv(
             "OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"
         )
-        self.model = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+        self.model = os.getenv("OLLAMA_MODEL", "gemma4:latest")
         self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
         # thinking(推論)モード。gemma4 等の対応モデルで思考トレースを有効化する。
         # CPU推論では遅くなるため既定はオフ。Ollamaは thinking を response と分離する。

@@ -102,7 +102,8 @@ def test_favicon_and_healthz(tmp_path: Path) -> None:
 
     from app.main import JobService, create_app
 
-    service = JobService(tmp_path / "jobs", llm=StubLLM())
+    # healthz は llm.diagnose() を呼ぶので本物の LLMClient を使う（Ollama未起動でも200）
+    service = JobService(tmp_path / "jobs")
     client = TestClient(create_app(service))
     assert client.get("/favicon.ico").status_code == 204
     health = client.get("/healthz")

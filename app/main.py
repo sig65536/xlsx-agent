@@ -1093,9 +1093,21 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, Any]:
-        # Ollama 疎通とモデルの存在も返す（メッセージ送信の400切り分けに使える）
-        diag = await run_in_threadpool(service.llm.diagnose)
-        return {"status": "ok", **diag}
+        # Ollama 疎通とモデルの存在も返す（メッセージ送信の400切り分けに使える）。
+        # diagnose を持たない LLM が注入されても落ちないようにする。
+        llm = service.llm
+        info: dict[str, Any] = {
+            "status": "ok",
+            "model": getattr(llm, "model", None),
+            "think": getattr(llm, "think", None),
+        }
+        diagnose = getattr(llm, "diagnose", None)
+        if callable(diagnose):
+            try:
+                info.update(await run_in_threadpool(diagnose))
+            except Exception:
+                pass
+        return info
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:

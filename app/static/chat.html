@@ -208,7 +208,7 @@ async function send(){
       if (st.status === "processing") {
         bubble.innerHTML = `<span class="spinner"></span> ${esc(st.phase || "処理中…")}`;
       } else if (st.status === "done") {
-        bubble.innerHTML = previewHtml(st.preview);
+        bubble.innerHTML = st.preview ? previewHtml(st.preview) : '<div class="notice info">完了しました。</div>';
         $("undoBtn").disabled = !st.can_undo;
         break;
       } else { // error

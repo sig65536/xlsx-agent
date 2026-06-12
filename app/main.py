@@ -1220,13 +1220,16 @@ def create_app(job_service: JobService | None = None) -> FastAPI:
                 pass
         return info
 
+    # HTML はキャッシュさせない（更新後に古いJSが残ってAPIと不整合になるのを防ぐ）
+    _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "chat.html")
+        return FileResponse(STATIC_DIR / "chat.html", headers=_NO_CACHE)
 
     @app.get("/classic", include_in_schema=False)
     async def classic() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
